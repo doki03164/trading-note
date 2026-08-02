@@ -12,3 +12,6 @@ work/
 .idea/
 .vscode/
 android/local.properties
+.env
+.env.*
+!.env.example

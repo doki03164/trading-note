@@ -53,3 +53,29 @@ export interface TradingNote {
   screenshot: string;
   screenshotName: string;
 }
+
+export type TradeSide = 'LONG' | 'SHORT';
+
+export interface JournalTrade {
+  id: string;
+  openedAt: string;
+  closedAt: string;
+  symbol: string;
+  side: TradeSide;
+  strategy: string;
+  entryPrice: number;
+  exitPrice: number;
+  quantity: number;
+  stopLoss: number;
+  fees: number;
+  notes: string;
+  tags: string[];
+}
+
+export interface Playbook {
+  id: string;
+  name: string;
+  description: string;
+  rules: string[];
+  createdAt: number;
+}

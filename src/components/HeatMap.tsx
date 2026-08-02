@@ -1,6 +1,6 @@
 import type { MarketCoin, SizeMetric } from '../types';
 
-interface Props { data: MarketCoin[]; sizeMetric: SizeMetric; selected?: MarketCoin; onSelect: (coin: MarketCoin) => void }
+interface Props { data: MarketCoin[]; sizeMetric: SizeMetric; selected?: MarketCoin; onSelect: (coin: MarketCoin) => void; valueMode?: 'pnl' | 'change' }
 
 function color(pnl: number, position: number) {
   const strength = Math.min(Math.abs(pnl) / Math.max(position * 0.08, 1), 1);
@@ -15,7 +15,7 @@ function fmtPrice(price: number) {
   return `$${price.toPrecision(3)}`;
 }
 
-export function HeatMap({ data, sizeMetric, selected, onSelect }: Props) {
+export function HeatMap({ data, sizeMetric, selected, onSelect, valueMode = 'pnl' }: Props) {
   const max = Math.max(...data.map(d => sizeMetric === 'position' ? d.positionValue : Math.abs(d.dailyPnl)), 1);
   return (
     <div className="heat-grid" aria-label="Market heat map">
@@ -31,7 +31,7 @@ export function HeatMap({ data, sizeMetric, selected, onSelect }: Props) {
           >
             <span className="coin-symbol">{coin.base}</span>
             <span className="coin-price">{fmtPrice(coin.price)}</span>
-            <span className={`coin-pnl ${coin.dailyPnl >= 0 ? 'up' : 'down'}`}>{coin.dailyPnl >= 0 ? '+' : '−'}${Math.abs(coin.dailyPnl).toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+            <span className={`coin-pnl ${coin.dailyPnl >= 0 ? 'up' : 'down'}`}>{coin.dailyPnl >= 0 ? '+' : '−'}{valueMode === 'pnl' ? '$' : ''}{Math.abs(coin.dailyPnl).toLocaleString(undefined, { maximumFractionDigits: valueMode === 'pnl' ? 0 : 2 })}{valueMode === 'change' ? '%' : ''}</span>
             <span className="coin-change">{coin.change24h >= 0 ? '+' : ''}{coin.change24h.toFixed(2)}%</span>
           </button>
         );

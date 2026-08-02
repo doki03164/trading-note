@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Activity, Bell, CalendarDays, ChevronDown, CircleHelp, Command, Expand, History, KeyRound, LayoutGrid, ListFilter, LogOut, NotebookPen, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Trash2, WalletCards, Wifi, WifiOff, X } from 'lucide-react';
+import { Activity, BarChart3, Bell, BookOpen, CalendarDays, ChevronDown, CircleHelp, Cloud, Command, Expand, History, KeyRound, LayoutGrid, List, ListFilter, LogOut, NotebookPen, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Trash2, Wifi, WifiOff, X } from 'lucide-react';
 import { HeatMap } from './components/HeatMap';
 import { Sparkline } from './components/Sparkline';
 import { TradingNotes } from './components/TradingNotes';
+import { TradeLog } from './components/TradeLog';
+import { Reports } from './components/Reports';
+import { Playbooks } from './components/Playbooks';
+import { CloudAccount } from './components/CloudAccount';
 import { useMarkets } from './hooks/useMarkets';
 import { clearProfitHistory, connectBitgetAccount, deleteSavedBitgetLogin, disconnectBitgetAccount, hasSavedBitgetLogin, loadProfitHistory, loginBitgetAccount, refreshBitgetAccount } from './services/accountBridge';
 import type { Exchange, FuturesBalance, MarketCoin, ProfitHistoryEntry, SizeMetric, TimeRange } from './types';
@@ -13,7 +17,7 @@ const ranges: TimeRange[] = ['1H', '4H', '1D', '1W'];
 function fmtCompact(n: number) { return new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(n); }
 
 export default function App() {
-  const [view, setView] = useState<'heatmap' | 'history' | 'notes'>('heatmap');
+  const [view, setView] = useState<'heatmap' | 'trades' | 'reports' | 'history' | 'notes' | 'playbooks' | 'cloud'>('heatmap');
   const [exchange, setExchange] = useState<Exchange>('binance');
   const [range, setRange] = useState<TimeRange>('1D');
   const [sizeMetric, setSizeMetric] = useState<SizeMetric>('position');
@@ -106,11 +110,11 @@ export default function App() {
   const filtered = useMemo(() => data.filter(c => c.base.toLowerCase().includes(query.toLowerCase())), [data, query]);
   const stats = useMemo(() => ({
     value: data.reduce((a, c) => a + c.positionValue, 0),
-    pnl: data.reduce((a, c) => a + c.dailyPnl, 0),
+    pnl: usingAccount ? data.reduce((a, c) => a + c.dailyPnl, 0) : (data.reduce((a, c) => a + c.quoteVolume, 0) ? data.reduce((a, c) => a + c.change24h * c.quoteVolume, 0) / data.reduce((a, c) => a + c.quoteVolume, 0) : 0),
     gainers: data.filter(c => c.dailyPnl > 0).length,
     losers: data.filter(c => c.dailyPnl < 0).length,
-    average: data.reduce((a, c) => a + c.positionValue, 0) ? data.reduce((a, c) => a + c.dailyPnl, 0) / data.reduce((a, c) => a + c.positionValue, 0) * 100 : 0
-  }), [data]);
+    average: usingAccount && data.reduce((a, c) => a + c.positionValue, 0) ? data.reduce((a, c) => a + c.dailyPnl, 0) / data.reduce((a, c) => a + c.positionValue, 0) * 100 : 0
+  }), [data, usingAccount]);
 
   const chartHistory = history.slice(-60);
   const maxHistoryPnl = Math.max(...chartHistory.map(h => Math.abs(h.totalPnl)), 1);
@@ -123,9 +127,12 @@ export default function App() {
       <div className="brand"><div className="brand-mark"><Activity size={18}/></div><span>Trading <span>Journal</span></span></div>
       <nav className={mobileMenu ? 'open' : ''}>
         <button className={view === 'heatmap' ? 'nav-active' : ''} onClick={() => setView('heatmap')}><LayoutGrid size={16}/> Heatmap</button>
+        <button className={view === 'trades' ? 'nav-active' : ''} onClick={() => setView('trades')}><List size={16}/> Trade Log</button>
+        <button className={view === 'reports' ? 'nav-active' : ''} onClick={() => setView('reports')}><BarChart3 size={16}/> Reports</button>
         <button className={view === 'history' ? 'nav-active' : ''} onClick={() => { setView('history'); loadHistory(); }}><History size={16}/> History</button>
         <button className={view === 'notes' ? 'nav-active' : ''} onClick={() => setView('notes')}><NotebookPen size={16}/> Trading Notes</button>
-        <button><WalletCards size={16}/> Watchlist</button>
+        <button className={view === 'playbooks' ? 'nav-active' : ''} onClick={() => setView('playbooks')}><BookOpen size={16}/> Playbooks</button>
+        <button className={view === 'cloud' ? 'nav-active' : ''} onClick={() => setView('cloud')}><Cloud size={16}/> Cloud</button>
       </nav>
       <div className="top-actions">
         {bitgetConnected
@@ -139,14 +146,15 @@ export default function App() {
 
     <main>
       <section className="page-heading">
-        <div><div className="eyebrow"><span/> DAILY PORTFOLIO INTELLIGENCE</div><h1>{view === 'heatmap' ? 'Daily Profit Heatmap' : view === 'history' ? 'Profit History' : 'Trading Notes'}</h1><p>{view === 'heatmap' ? 'See exactly where today’s portfolio profit and loss comes from.' : view === 'history' ? 'Review locally saved Bitget P&L snapshots over time.' : 'Upload chart screenshots and review your past trading decisions.'}</p></div>
-        <div className={`connection ${live ? '' : 'offline'}`}>{live ? <Wifi size={14}/> : <WifiOff size={14}/>}<span>{usingAccount ? 'Bitget account · UTC daily P&L' : live ? 'Live prices · demo positions' : 'Demo portfolio'}</span><small>{updatedAt?.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small></div>
+        <div><div className="eyebrow"><span/> TRADING PERFORMANCE INTELLIGENCE</div><h1>{{heatmap:'Daily Profit Heatmap',trades:'Trade Log',reports:'Performance Reports',history:'Profit History',notes:'Trading Notes',playbooks:'Strategy Playbooks',cloud:'Cloud Database'}[view]}</h1><p>{{heatmap:'See exactly where today’s portfolio profit and loss comes from.',trades:'Log executions, fees, risk and setup context in one searchable database.',reports:'Measure win rate, expectancy, profit factor and strategy performance.',history:'Review locally saved Bitget P&L snapshots over time.',notes:'Upload chart screenshots and review your past trading decisions.',playbooks:'Define repeatable setups and review their actual results.',cloud:'Synchronize your private journal across every installed device.'}[view]}</p></div>
+        <div className={`connection ${live ? '' : 'offline'}`}>{live ? <Wifi size={14}/> : <WifiOff size={14}/>}<span>{usingAccount ? 'Bitget account · UTC daily P&L' : live ? `Live ${exchange} market data` : "Can't connect to API"}</span><small>{updatedAt?.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small></div>
       </section>
 
       {view === 'heatmap' ? <>
+      {!usingAccount && market.error && <div className="market-api-error"><WifiOff size={18}/><div><strong>Can't connect to API</strong><span>{market.error}</span></div><button onClick={market.refresh}>Retry</button></div>}
       <section className="stat-row">
-        <article><div><span>{usingAccount ? "UTC TODAY'S NET P&L" : "TODAY'S PROFIT"}</span><strong className={stats.pnl >= 0 ? 'profit-text' : 'loss-text'}>{stats.pnl >= 0 ? '+' : '−'}${fmtCompact(Math.abs(stats.pnl))}</strong><em className={stats.pnl >= 0 ? 'positive' : 'negative'}>{stats.average >= 0 ? '+' : ''}{stats.average.toFixed(2)}% today</em></div><div className="mini-chart"><Sparkline positive={stats.pnl >= 0}/></div></article>
-        <article><div><span>PORTFOLIO VALUE</span><strong>${fmtCompact(stats.value)}</strong><em className="muted">Connected spot assets</em></div><div className="mini-chart"><Sparkline positive={stats.pnl >= 0}/></div></article>
+        <article><div><span>{usingAccount ? "UTC TODAY'S NET P&L" : 'VOLUME-WEIGHTED 24H CHANGE'}</span><strong className={stats.pnl >= 0 ? 'profit-text' : 'loss-text'}>{stats.pnl >= 0 ? '+' : '−'}{usingAccount ? '$' : ''}{usingAccount ? fmtCompact(Math.abs(stats.pnl)) : `${Math.abs(stats.pnl).toFixed(2)}%`}</strong><em className={stats.pnl >= 0 ? 'positive' : 'negative'}>{usingAccount ? `${stats.average >= 0 ? '+' : ''}${stats.average.toFixed(2)}% today` : 'Calculated from live exchange tickers'}</em></div><div className="mini-chart"><Sparkline positive={stats.pnl >= 0}/></div></article>
+        <article><div><span>{usingAccount ? 'PORTFOLIO VALUE' : '24H QUOTE VOLUME'}</span><strong>${fmtCompact(stats.value)}</strong><em className="muted">{usingAccount ? 'Connected spot assets' : 'Live USDT markets'}</em></div><div className="mini-chart"><Sparkline positive={stats.pnl >= 0}/></div></article>
         <article><div><span>PROFIT CONTRIBUTORS</span><strong>{stats.gainers} <small>/ {stats.losers}</small></strong><em className="muted">Profitable / Losing</em></div><div className="breadth"><i style={{width:`${(stats.gainers / Math.max(stats.gainers + stats.losers, 1)) * 100}%`}}/></div></article>
       </section>
 
@@ -194,7 +202,7 @@ export default function App() {
         </div>
 
         <div className={`map-card ${loading && !data.length ? 'loading' : ''}`}>
-          <HeatMap data={filtered} sizeMetric={sizeMetric} selected={selected} onSelect={setSelected}/>
+          <HeatMap data={filtered} sizeMetric={sizeMetric} selected={selected} onSelect={setSelected} valueMode={usingAccount ? 'pnl' : 'change'}/>
           {!filtered.length && <div className="empty">No matching assets</div>}
           <div className="map-footer"><div className="legend"><span>Daily profit</span><div className="legend-bar"/><span>Loss</span><span>Flat</span><span>Profit</span></div><button><Expand size={14}/> Fullscreen</button></div>
         </div>
@@ -210,7 +218,7 @@ export default function App() {
           </div>
           <div className="history-table"><div className="history-row header"><span>Saved time</span><span>Net P&L</span><span>Portfolio value</span><span>Assets</span><span>Top contributor</span><span/></div>{history.slice().reverse().slice(0,100).map(entry => { const top = entry.positions.slice().sort((a,b) => Math.abs(b.dailyPnl)-Math.abs(a.dailyPnl))[0]; return <div className={`history-row ${historySnapshot?.timestamp === entry.timestamp ? 'selected' : ''}`} key={entry.timestamp}><span>{new Date(entry.timestamp).toLocaleString()}</span><strong className={entry.totalPnl >= 0 ? 'positive' : 'negative'}>{entry.totalPnl >= 0 ? '+' : '−'}${Math.abs(entry.totalPnl).toFixed(2)}</strong><span>${fmtCompact(entry.portfolioValue)}</span><span>{entry.positions.length}</span><span>{top ? `${top.base} ${top.dailyPnl >= 0 ? '+' : '−'}$${Math.abs(top.dailyPnl).toFixed(2)}` : '—'}</span><button onClick={() => setHistorySnapshot(entry)}><LayoutGrid size={12}/> View</button></div>})}</div>
         </> : <div className="history-empty"><History size={28}/><h3>No saved snapshots yet</h3><p>Connect Bitget once; Trading Journal will save the first record immediately.</p><button onClick={() => { setView('heatmap'); setConnectOpen(true); }}><KeyRound size={14}/> Connect Bitget</button></div>}
-      </section> : <TradingNotes/>}
+      </section> : view === 'notes' ? <TradingNotes/> : view === 'trades' ? <TradeLog/> : view === 'reports' ? <Reports/> : view === 'playbooks' ? <Playbooks/> : <CloudAccount/>}
     </main>
 
     {selected && <aside className="detail-panel">

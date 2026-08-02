@@ -7,6 +7,10 @@ interface ApiEnvelope<T> { code: string; msg?: string; message?: string; data: T
 interface SpotAsset { coin: string; available: string; frozen: string; locked: string }
 interface SpotTicker { symbol: string; lastPr: string; openUtc: string; quoteVolume: string; high24h: string; low24h: string }
 interface FuturesPosition { symbol: string; holdSide: string; marginSize: string; total: string; unrealizedPL: string; markPrice: string }
+interface UtaFuturesPosition { symbol: string; posSide: string; positionBalance: string; total: string; unrealisedPnl: string; markPrice: string }
+interface UtaPositionData { list: UtaFuturesPosition[] }
+interface UtaAsset { coin: string; balance: string; available: string; locked: string }
+interface UtaAccountData { accountEquity: string; usdtEquity: string; unrealisedPnl: string; usdtUnrealisedPnl: string; assets: UtaAsset[] }
 interface FuturesTicker { symbol: string; openUtc: string; markPrice: string }
 interface FuturesBill { symbol: string; amount: string; fee: string; businessType: string }
 interface FuturesAccount { marginCoin: string; available?: string; locked?: string; accountEquity?: string; unrealizedPL?: string; maxTransferOut?: string }
@@ -51,17 +55,32 @@ function isPnlBill(type: string) {
   return !type.startsWith('trans_') && !['append_margin', 'adjust_down_lever_append_margin', 'reduce_margin', 'auto_append_margin', 'cash_gift_issue', 'cash_gift_recycle', 'bonus_issue', 'bonus_recycle', 'bonus_expired'].includes(type);
 }
 
+export function normalizeUtaPosition(position: UtaFuturesPosition): FuturesPosition {
+  return { symbol: position.symbol, holdSide: position.posSide, marginSize: position.positionBalance, total: position.total, unrealizedPL: position.unrealisedPnl, markPrice: position.markPrice };
+}
+
+async function mobileFuturesPositions(credentials: Credentials) {
+  const classic = await request<FuturesPosition[]>('/api/v2/mix/position/all-position', 'productType=USDT-FUTURES&marginCoin=USDT', credentials).catch(() => undefined);
+  if (classic?.length) return classic;
+  const unified = await request<UtaPositionData>('/api/v3/position/current-position', 'category=USDT-FUTURES', credentials).catch(() => undefined);
+  if (unified) return unified.list.map(normalizeUtaPosition);
+  if (classic) return classic;
+  throw new Error('Futures positions were rejected by both Bitget Classic and Unified Account APIs. Enable futures/UTA read permission.');
+}
+
 async function mobilePortfolio(credentials: Credentials): Promise<PortfolioResponse> {
   const dayStart = Date.now() - Date.now() % 86_400_000;
-  const [tickers, futuresTickers, assetsResult, futuresResult, billsResult, accountsResult] = await Promise.all([
+  const [tickers, futuresTickers, classicAssets, futuresResult, billsResult, classicAccounts, utaAccount] = await Promise.all([
     request<SpotTicker[]>('/api/v2/spot/market/tickers'),
     request<FuturesTicker[]>('/api/v2/mix/market/tickers', 'productType=USDT-FUTURES'),
     request<SpotAsset[]>('/api/v2/spot/account/assets', 'assetType=hold_only', credentials).catch(() => []),
-    request<FuturesPosition[]>('/api/v2/mix/position/all-position', 'productType=USDT-FUTURES&marginCoin=USDT', credentials).catch(() => []),
+    mobileFuturesPositions(credentials),
     request<{ bills: FuturesBill[] }>('/api/v2/mix/account/bill', `productType=USDT-FUTURES&startTime=${dayStart}&endTime=${Date.now()}&limit=100`, credentials).catch(() => ({ bills: [] })),
     request<FuturesAccount[]>('/api/v2/mix/account/accounts', 'productType=USDT-FUTURES', credentials).catch(() => []),
+    request<UtaAccountData>('/api/v3/account/assets', '', credentials).catch(() => undefined),
   ]);
-  if (!assetsResult.length && !futuresResult.length && !accountsResult.length) throw new Error('No Bitget holdings returned. Check API read permissions.');
+  const assetsResult: SpotAsset[] = classicAssets.length ? classicAssets : (utaAccount?.assets ?? []).map(asset => ({ coin: asset.coin, available: asset.available, frozen: '0', locked: asset.locked }));
+  if (!assetsResult.length && !futuresResult.length && !classicAccounts.length && !utaAccount) throw new Error('No Bitget holdings returned. Check API read permissions.');
 
   const tickerMap = new Map(tickers.map(ticker => [ticker.symbol, ticker]));
   const futuresTickerMap = new Map(futuresTickers.map(ticker => [ticker.symbol, ticker]));
@@ -104,8 +123,11 @@ async function mobilePortfolio(credentials: Credentials): Promise<PortfolioRespo
   }
   positions.sort((a, b) => b.positionValue - a.positionValue);
 
-  const account = accountsResult.find(item => item.marginCoin.toUpperCase() === 'USDT');
-  const futuresBalance: FuturesBalance | undefined = account ? { marginCoin: account.marginCoin, available: number(account.available), locked: number(account.locked), accountEquity: number(account.accountEquity), unrealizedPnl: number(account.unrealizedPL), maxTransferOut: number(account.maxTransferOut) } : undefined;
+  const account = classicAccounts.find(item => item.marginCoin.toUpperCase() === 'USDT');
+  const utaUsdt = utaAccount?.assets.find(asset => asset.coin.toUpperCase() === 'USDT');
+  const futuresBalance: FuturesBalance | undefined = account
+    ? { marginCoin: account.marginCoin, available: number(account.available), locked: number(account.locked), accountEquity: number(account.accountEquity), unrealizedPnl: number(account.unrealizedPL), maxTransferOut: number(account.maxTransferOut) }
+    : utaAccount ? { marginCoin: 'USDT', available: number(utaUsdt?.available), locked: number(utaUsdt?.locked), accountEquity: number(utaAccount.usdtEquity || utaAccount.accountEquity), unrealizedPnl: number(utaAccount.usdtUnrealisedPnl || utaAccount.unrealisedPnl), maxTransferOut: number(utaUsdt?.available) } : undefined;
   return { positions, futuresBalance };
 }
 

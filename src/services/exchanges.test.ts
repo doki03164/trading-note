@@ -16,8 +16,9 @@ describe('exchange market adapters', () => {
 
     const rows = await fetchBinance();
     expect(rows.map(row => row.base)).toEqual(['BTC', 'ETH']);
-    expect(rows[0].dailyPnl).toBe(1620);
-    expect(rows[1].dailyPnl).toBe(-437);
+    expect(rows[0].dailyPnl).toBe(5);
+    expect(rows[0].positionValue).toBe(100);
+    expect(rows[1].dailyPnl).toBe(-2);
   });
 
   it('normalizes Bitget fractional 24-hour change into percent', async () => {
@@ -31,14 +32,11 @@ describe('exchange market adapters', () => {
     const rows = await fetchBitget();
     expect(rows).toHaveLength(1);
     expect(rows[0].change24h).toBe(2.5);
-    expect(rows[0].dailyPnl).toBe(810);
+    expect(rows[0].dailyPnl).toBe(2.5);
   });
 
-  it('returns a populated demo portfolio when a public endpoint is offline', async () => {
+  it('reports an API failure instead of returning fabricated data', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')));
-    const result = await fetchMarkets('bitget');
-    expect(result.live).toBe(false);
-    expect(result.data).toHaveLength(20);
-    expect(result.data.every(row => Number.isFinite(row.dailyPnl))).toBe(true);
+    await expect(fetchMarkets('bitget')).rejects.toThrow('offline');
   });
 });

@@ -39,6 +39,25 @@ jobs:
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/msi/*.msi
 
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+      - run: npm run desktop:build -- --bundles dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trading-journal-macos
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+
   android:
     runs-on: ubuntu-latest
     steps:

@@ -32,6 +32,21 @@ struct Asset { coin: String, available: String, frozen: String, locked: String }
 #[serde(rename_all = "camelCase")]
 struct FuturesPosition { symbol: String, hold_side: String, margin_size: String, total: String, unrealized_pl: String, mark_price: String }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UtaFuturesPosition { symbol: String, pos_side: String, position_balance: String, total: String, unrealised_pnl: String, mark_price: String }
+
+#[derive(Deserialize)]
+struct UtaPositionData { list: Vec<UtaFuturesPosition> }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UtaAsset { coin: String, #[serde(default)] available: String, #[serde(default)] locked: String }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UtaAccountData { #[serde(default)] account_equity: String, #[serde(default)] usdt_equity: String, #[serde(default)] unrealised_pnl: String, #[serde(default)] usdt_unrealised_pnl: String, #[serde(default)] assets: Vec<UtaAsset> }
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FuturesTicker { symbol: String, open_utc: String, mark_price: String }
@@ -255,6 +270,64 @@ async fn get_futures(credentials: &BitgetCredentials) -> Result<Vec<FuturesPosit
     Ok(payload.data)
 }
 
+async fn get_uta_futures(credentials: &BitgetCredentials) -> Result<Vec<FuturesPosition>, String> {
+    let path = "/api/v3/position/current-position";
+    let query = "category=USDT-FUTURES";
+    let timestamp = timestamp_ms();
+    let sign = signature(&credentials.api_secret, &timestamp, "GET", path, query)?;
+    let response = Client::new().get(format!("https://api.bitget.com{path}?{query}"))
+        .header("ACCESS-KEY", &credentials.api_key).header("ACCESS-SIGN", sign)
+        .header("ACCESS-PASSPHRASE", &credentials.passphrase).header("ACCESS-TIMESTAMP", timestamp)
+        .header("Content-Type", "application/json").header("locale", "en-US")
+        .send().await.map_err(|e| format!("Bitget UTA futures connection failed: {e}"))?;
+    let status = response.status();
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() { return Err(format!("Bitget UTA futures HTTP {status}")); }
+    let payload: ApiResponse<UtaPositionData> = serde_json::from_str(&body).map_err(|_| "Invalid Bitget UTA futures response".to_string())?;
+    if payload.code != "00000" { return Err(if payload.msg.is_empty() { format!("Bitget UTA error {}", payload.code) } else { payload.msg }); }
+    Ok(payload.data.list.into_iter().map(|position| FuturesPosition {
+        symbol: position.symbol, hold_side: position.pos_side, margin_size: position.position_balance,
+        total: position.total, unrealized_pl: position.unrealised_pnl, mark_price: position.mark_price,
+    }).collect())
+}
+
+async fn get_all_futures(credentials: &BitgetCredentials) -> Result<Vec<FuturesPosition>, String> {
+    match get_futures(credentials).await {
+        Ok(positions) if !positions.is_empty() => Ok(positions),
+        classic => match get_uta_futures(credentials).await {
+            Ok(positions) => Ok(positions),
+            Err(uta_error) => match classic { Ok(empty) => Ok(empty), Err(classic_error) => Err(format!("Classic: {classic_error}; Unified: {uta_error}")) },
+        },
+    }
+}
+
+async fn get_uta_account(credentials: &BitgetCredentials) -> Result<UtaAccountData, String> {
+    let path = "/api/v3/account/assets";
+    let timestamp = timestamp_ms();
+    let sign = signature(&credentials.api_secret, &timestamp, "GET", path, "")?;
+    let response = Client::new().get(format!("https://api.bitget.com{path}"))
+        .header("ACCESS-KEY", &credentials.api_key).header("ACCESS-SIGN", sign)
+        .header("ACCESS-PASSPHRASE", &credentials.passphrase).header("ACCESS-TIMESTAMP", timestamp)
+        .header("Content-Type", "application/json").header("locale", "en-US")
+        .send().await.map_err(|e| format!("Bitget UTA account connection failed: {e}"))?;
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    let payload: ApiResponse<UtaAccountData> = serde_json::from_str(&body).map_err(|_| "Invalid Bitget UTA account response".to_string())?;
+    if payload.code != "00000" { return Err(if payload.msg.is_empty() { format!("Bitget UTA error {}", payload.code) } else { payload.msg }); }
+    Ok(payload.data)
+}
+
+fn summarize_uta_balance(account: UtaAccountData) -> FuturesBalanceSummary {
+    let usdt = account.assets.iter().find(|asset| asset.coin.eq_ignore_ascii_case("USDT"));
+    FuturesBalanceSummary {
+        margin_coin: "USDT".into(),
+        available: usdt.map(|asset| parse_number(&asset.available)).unwrap_or(0.0),
+        locked: usdt.map(|asset| parse_number(&asset.locked)).unwrap_or(0.0),
+        account_equity: parse_number(if account.usdt_equity.is_empty() { &account.account_equity } else { &account.usdt_equity }),
+        unrealized_pnl: parse_number(if account.usdt_unrealised_pnl.is_empty() { &account.unrealised_pnl } else { &account.usdt_unrealised_pnl }),
+        max_transfer_out: usdt.map(|asset| parse_number(&asset.available)).unwrap_or(0.0),
+    }
+}
+
 async fn get_futures_accounts(credentials: &BitgetCredentials) -> Result<Vec<FuturesAccount>, String> {
     let path = "/api/v2/mix/account/accounts";
     let query = "productType=USDT-FUTURES";
@@ -325,14 +398,14 @@ async fn get_futures_bills(credentials: &BitgetCredentials) -> Result<Vec<Future
 
 async fn portfolio(credentials: &BitgetCredentials) -> Result<PortfolioResponse, String> {
     let (tickers, futures_tickers) = tokio::try_join!(get_tickers(), get_futures_tickers())?;
-    let (assets_result, futures_result, bills_result, accounts_result) = tokio::join!(get_assets(credentials), get_futures(credentials), get_futures_bills(credentials), get_futures_accounts(credentials));
+    let (assets_result, futures_result, bills_result, accounts_result, uta_account_result) = tokio::join!(get_assets(credentials), get_all_futures(credentials), get_futures_bills(credentials), get_futures_accounts(credentials), get_uta_account(credentials));
     if assets_result.is_err() && futures_result.is_err() {
         return Err(format!("Spot: {}; Futures: {}", assets_result.err().unwrap_or_default(), futures_result.err().unwrap_or_default()));
     }
     let assets = assets_result.unwrap_or_default();
     let futures = futures_result.unwrap_or_default();
     let bills = bills_result.unwrap_or_default();
-    let futures_balance = accounts_result.ok().and_then(summarize_futures_balance);
+    let futures_balance = accounts_result.ok().and_then(summarize_futures_balance).or_else(|| uta_account_result.ok().map(summarize_uta_balance));
     let ticker_map: HashMap<String, Ticker> = tickers.into_iter().map(|t| (t.symbol.clone(), t)).collect();
     let futures_ticker_map: HashMap<String, FuturesTicker> = futures_tickers.into_iter().map(|t| (t.symbol.clone(), t)).collect();
     let mut realized_by_symbol: HashMap<String, f64> = HashMap::new();
@@ -529,5 +602,14 @@ mod tests {
         assert_eq!(summary.locked, 20.5);
         assert_eq!(summary.account_equity, 130.75);
         assert_eq!(summary.unrealized_pnl, 5.0);
+    }
+
+    #[test]
+    fn uta_position_response_deserializes_current_contract() {
+        let payload: ApiResponse<UtaPositionData> = serde_json::from_str(r#"{"code":"00000","msg":"success","data":{"list":[{"symbol":"BTCUSDT","posSide":"short","positionBalance":"120","total":"0.01","unrealisedPnl":"4.5","markPrice":"90000"}]}}"#).unwrap();
+        let position = &payload.data.list[0];
+        assert_eq!(position.symbol, "BTCUSDT");
+        assert_eq!(position.pos_side, "short");
+        assert_eq!(position.position_balance, "120");
     }
 }

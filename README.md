@@ -1,6 +1,6 @@
 # Trading Journal
 
-Cross-platform crypto trading journal for **Windows desktop, iOS, and Android**. The app combines a daily profit heatmap, Bitget account holdings, saved P&L history, and screenshot-based trading notes in one React interface.
+Cross-platform crypto trading journal for **Windows, macOS, iOS, and Android**. It is a TradeZella-style performance workspace with an original interface and implementation: trade logging, reports, strategy playbooks, chart notes, cloud sync, daily-profit heatmaps, and Bitget account holdings.
 
 ## Features
 
@@ -13,6 +13,10 @@ Cross-platform crypto trading journal for **Windows desktop, iOS, and Android**.
 - Encrypted saved Bitget login protected by the user's Trading Journal password.
 - **Trading Notes:** upload a chart screenshot, record symbol/market/direction/setup/review, search history, reopen past notes, and delete notes.
 - Responsive desktop and phone layouts.
+- Searchable Trade Log with automatic net P&L and R-multiple calculations.
+- Performance reports for win rate, profit factor, expectancy, equity curve, and strategy results.
+- Strategy playbooks with rules and linked-trade performance.
+- Optional Supabase online database sync; GitHub stores source code only.
 
 ## Data and security
 
@@ -48,6 +52,11 @@ Windows desktop additionally requires:
 - Rust stable through `rustup`
 - Microsoft Visual Studio Build Tools with **Desktop development with C++**
 - Microsoft Edge WebView2 Runtime
+
+macOS desktop additionally requires:
+
+- A Mac running macOS
+- Xcode Command Line Tools (`xcode-select --install`)
 
 iOS additionally requires:
 
@@ -109,6 +118,19 @@ src-tauri/target/release/bundle/
 
 Run the generated `.exe` or `.msi` installer. If Windows reports a missing WebView runtime, install the Microsoft Edge WebView2 Evergreen Runtime.
 
+## Build and install macOS desktop
+
+On a Mac with Xcode Command Line Tools installed:
+
+```bash
+git clone https://github.com/doki03164/trading-note.git
+cd trading-note
+npm ci
+npm run desktop:build -- --bundles dmg
+```
+
+The DMG is created under `src-tauri/target/release/bundle/dmg/`. Open it and drag **Trading Journal** into Applications. Public GitHub builds are unsigned, so the first launch may require Control-clicking the app and choosing **Open**. Apple Developer signing and notarization are used for wider distribution.
+
 ## Build and install Android
 
 1. Install Android Studio, JDK 21, and the Android SDK.
@@ -137,7 +159,7 @@ Debug APK location:
 android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-For Google Play, create a signing key in Android Studio and use **Build → Generate Signed Bundle / APK → Android App Bundle**.
+For Google Play, create a signing key in Android Studio and use **Build ??Generate Signed Bundle / APK ??Android App Bundle**.
 
 ## Build and install iOS
 
@@ -160,7 +182,7 @@ In Xcode:
 5. If `com.pulsegrid.app` is already registered, choose a unique bundle identifier.
 6. Connect an iPhone, enable Developer Mode on it, choose it as the run destination, and press **Run**.
 
-For TestFlight or the App Store, choose a generic iOS device, select **Product → Archive**, and distribute the archive through App Store Connect.
+For TestFlight or the App Store, choose a generic iOS device, select **Product ??Archive**, and distribute the archive through App Store Connect.
 
 ## Refresh native projects after frontend changes
 
@@ -183,6 +205,8 @@ Create a Bitget API key and enable read access for:
 
 Enter the API key, API secret, and Bitget API passphrase in **Connect Bitget**. The app performs no trading or withdrawal commands.
 
+Both Bitget Classic Account (`/api/v2/mix`) and Unified Trading Account (`/api/v3`) open-position APIs are supported. If both APIs reject the request, Trading Journal displays the permission error instead of silently showing an empty contract list.
+
 ## Trading Notes workflow
 
 1. Open **Trading Notes** from the navigation bar.
@@ -191,6 +215,25 @@ Enter the API key, API secret, and Bitget API passphrase in **Connect Bitget**. 
 4. Add the symbol, trade date, market, direction, setup, and review text.
 5. Save the note.
 6. Use Trading Note History to search and review previous screenshots.
+
+## Online database and cross-device sync
+
+Optional cloud sync uses **Supabase PostgreSQL**, Auth, Row Level Security, and private Storage. GitHub stores source code and releases only.
+
+1. Create a Supabase project.
+2. Run `supabase/migrations/001_cloud_journal.sql` in the Supabase SQL editor.
+3. Copy `.env.example` to `.env`.
+4. Add the project values:
+
+```env
+VITE_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+VITE_SUPABASE_PUBLISHABLE_KEY=YOUR_PUBLISHABLE_KEY
+```
+
+5. Rebuild the application.
+6. Open **Cloud**, create an account or sign in, then select **Sync now**.
+
+The supplied RLS policies restrict every journal row and screenshot to its authenticated owner. Keep the Supabase service-role key outside the app.
 
 ## Useful commands
 
@@ -209,6 +252,8 @@ npm run ios:open        # Open Xcode on macOS
 
 - **Bitget connection error:** verify the key, secret, API passphrase, IP whitelist, and read permissions.
 - **Empty futures balance:** enable futures account and holdings read permissions.
+- **Can't connect to Binance API:** check internet, DNS, firewall, and regional API availability, then retry. The heatmap remains empty rather than displaying generated market data.
+- **Cloud not configured:** create `.env` from `.env.example`, apply the Supabase migration, and rebuild.
 - **Android Gradle reports Java missing:** install JDK 21 and set `JAVA_HOME`.
 - **Android SDK not found:** set `ANDROID_HOME` or create `android/local.properties` with `sdk.dir=...`.
 - **iOS CocoaPods error:** run `pod repo update`, followed by `pod install` inside `ios/App`.
