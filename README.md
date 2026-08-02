@@ -126,10 +126,10 @@ On a Mac with Xcode Command Line Tools installed:
 git clone https://github.com/doki03164/trading-note.git
 cd trading-note
 npm ci
-npm run desktop:build -- --bundles dmg
+npm run desktop:build -- --target universal-apple-darwin --bundles dmg
 ```
 
-The DMG is created under `src-tauri/target/release/bundle/dmg/`. Open it and drag **Trading Journal** into Applications. Public GitHub builds are unsigned, so the first launch may require Control-clicking the app and choosing **Open**. Apple Developer signing and notarization are used for wider distribution.
+The Universal DMG supports Apple Silicon and Intel Macs and is created under `src-tauri/target/universal-apple-darwin/release/bundle/dmg/`. Open it and drag **Trading Journal** into Applications. Public GitHub builds are unsigned, so the first launch may require Control-clicking the app and choosing **Open**. Apple Developer signing and notarization are used for wider distribution.
 
 ## Build and install Android
 

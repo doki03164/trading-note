@@ -48,15 +48,17 @@ jobs:
           node-version: 20
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
       - run: npm ci
       - run: npm test
       - run: npm run build
       - run: cargo test --manifest-path src-tauri/Cargo.toml --lib
-      - run: npm run desktop:build -- --bundles dmg
+      - run: npm run desktop:build -- --target universal-apple-darwin --bundles dmg
       - uses: actions/upload-artifact@v4
         with:
           name: trading-journal-macos
-          path: src-tauri/target/release/bundle/dmg/*.dmg
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
 
   android:
     runs-on: ubuntu-latest
