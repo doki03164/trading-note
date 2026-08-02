@@ -9,7 +9,8 @@ button { color:inherit; }
 .topbar { height:68px; padding:0 4.5vw; display:flex; align-items:center; border-bottom:1px solid #1b1e22; background:rgba(7,8,10,.88); backdrop-filter:blur(18px); position:sticky; top:0; z-index:20; }
 .brand { width:220px; display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:-.5px; font-size:17px; }
 .brand>span>span { color:var(--green); }
-.brand-mark { width:32px; height:32px; display:grid; place-items:center; border:1px solid #345c4b; border-radius:9px; color:var(--green); background:#11251d; box-shadow:inset 0 0 14px rgba(81,228,160,.09); }
+.brand-mark { width:32px; height:32px; display:grid; place-items:center; border:1px solid #5d4b12; border-radius:9px; background:#fcc11d; overflow:hidden; }
+.brand-mark img { width:100%; height:100%; display:block; object-fit:cover; }
 nav { display:flex; height:100%; gap:8px; }
 nav button { border:0; border-bottom:2px solid transparent; background:transparent; padding:0 15px; color:#7f8790; display:flex; align-items:center; gap:7px; font-size:13px; font-weight:600; }
 nav button:hover,nav .nav-active { color:#f4f6f7; }

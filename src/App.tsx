@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Activity, BarChart3, Bell, BookOpen, CalendarDays, ChevronDown, CircleHelp, Cloud, Command, Expand, History, KeyRound, LayoutGrid, List, ListFilter, LogOut, NotebookPen, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Trash2, Wifi, WifiOff, X } from 'lucide-react';
+import { BarChart3, Bell, BookOpen, CalendarDays, ChevronDown, CircleHelp, Cloud, Command, Expand, History, KeyRound, LayoutGrid, List, ListFilter, LogOut, NotebookPen, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Trash2, Wifi, WifiOff, X } from 'lucide-react';
 import { HeatMap } from './components/HeatMap';
 import { Sparkline } from './components/Sparkline';
 import { TradingNotes } from './components/TradingNotes';
@@ -134,7 +134,7 @@ export default function App() {
 
   return <div className="app-shell">
     <header className="topbar">
-      <div className="brand"><div className="brand-mark"><Activity size={18}/></div><span>Trading <span>Journal</span></span></div>
+      <div className="brand"><div className="brand-mark"><img src="/app-icon.png" alt=""/></div><span>Trading <span>Journal</span></span></div>
       <nav className={mobileMenu ? 'open' : ''}>
         <button className={view === 'heatmap' ? 'nav-active' : ''} onClick={() => setView('heatmap')}><LayoutGrid size={16}/> Heatmap</button>
         <button className={view === 'trades' ? 'nav-active' : ''} onClick={() => setView('trades')}><List size={16}/> Trade Log</button>
@@ -272,6 +272,6 @@ export default function App() {
       </form>
     </div>}
 
-    <footer><span><CircleHelp size={14}/> Live data refreshes every 10 seconds</span><span><Settings2 size={14}/> v0.2.3</span></footer>
+    <footer><span><CircleHelp size={14}/> Live data refreshes every 10 seconds</span><span><Settings2 size={14}/> v0.2.4</span></footer>
   </div>;
 }

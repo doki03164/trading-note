@@ -35,6 +35,7 @@ src/components/TradingNotes.tsx
 src/services/accountBridge.ts  Desktop/mobile Bitget bridge
 src/services/tradingNotes.ts   IndexedDB note persistence
 src-tauri/                   Tauri 2 Windows desktop backend
+assets/                      Source artwork and generated app-icon inputs
 android/                     Capacitor Android Studio project
 ios/                         Capacitor Xcode project
 ```
