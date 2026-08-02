@@ -1,6 +1,6 @@
 [package]
 name = "trading-journal"
-version = "0.2.0"
+version = "0.2.1"
 description = "Daily profit heatmap for Binance and Bitget portfolios"
 authors = ["Trading Journal"]
 edition = "2021"

@@ -26,6 +26,7 @@ function isTauriDesktop() {
 }
 
 function number(value?: string) { const parsed = Number(value ?? 0); return Number.isFinite(parsed) ? parsed : 0; }
+export function canonicalFuturesSymbol(value: string) { return value.trim().toUpperCase().replace(/PERP$/, ''); }
 function bytesToBase64(bytes: Uint8Array) { let binary = ''; for (const byte of bytes) binary += String.fromCharCode(byte); return btoa(binary); }
 function base64ToBytes(value: string) { const binary = atob(value); return Uint8Array.from(binary, character => character.charCodeAt(0)); }
 
@@ -60,7 +61,7 @@ export function normalizeUtaPosition(position: UtaFuturesPosition): FuturesPosit
 }
 
 async function mobileFuturesPositions(credentials: Credentials) {
-  const classic = await request<FuturesPosition[]>('/api/v2/mix/position/all-position', 'productType=USDT-FUTURES&marginCoin=USDT', credentials).catch(() => undefined);
+  const classic = await request<FuturesPosition[]>('/api/v2/mix/position/all-position', 'productType=USDT-FUTURES', credentials).catch(() => undefined);
   if (classic?.length) return classic;
   const unified = await request<UtaPositionData>('/api/v3/position/current-position', 'category=USDT-FUTURES', credentials).catch(() => undefined);
   if (unified) return unified.list.map(normalizeUtaPosition);
@@ -83,10 +84,10 @@ async function mobilePortfolio(credentials: Credentials): Promise<PortfolioRespo
   if (!assetsResult.length && !futuresResult.length && !classicAccounts.length && !utaAccount) throw new Error('No Bitget holdings returned. Check API read permissions.');
 
   const tickerMap = new Map(tickers.map(ticker => [ticker.symbol, ticker]));
-  const futuresTickerMap = new Map(futuresTickers.map(ticker => [ticker.symbol, ticker]));
+  const futuresTickerMap = new Map(futuresTickers.map(ticker => [canonicalFuturesSymbol(ticker.symbol), ticker]));
   const realized = new Map<string, number>();
   for (const bill of billsResult.bills.filter(bill => isPnlBill(bill.businessType))) {
-    if (bill.symbol) realized.set(bill.symbol, (realized.get(bill.symbol) ?? 0) + number(bill.amount) + number(bill.fee));
+    if (bill.symbol) { const symbol = canonicalFuturesSymbol(bill.symbol); realized.set(symbol, (realized.get(symbol) ?? 0) + number(bill.amount) + number(bill.fee)); }
   }
 
   const positions: MarketCoin[] = [];
@@ -106,15 +107,16 @@ async function mobilePortfolio(credentials: Credentials): Promise<PortfolioRespo
   }
   for (const position of futuresResult) {
     const total = number(position.total), margin = number(position.marginSize);
-    const ticker = futuresTickerMap.get(position.symbol);
+    const symbol = canonicalFuturesSymbol(position.symbol);
+    const ticker = futuresTickerMap.get(symbol);
     const mark = number(ticker?.markPrice) || number(position.markPrice), open = number(ticker?.openUtc);
     if (total <= 0 || mark <= 0) continue;
     const side = position.holdSide.toUpperCase();
-    const realizedToday = realized.get(position.symbol) ?? 0;
-    realized.delete(position.symbol);
+    const realizedToday = realized.get(symbol) ?? 0;
+    realized.delete(symbol);
     const pnl = (open > 0 ? total * (side === 'SHORT' ? open - mark : mark - open) : number(position.unrealizedPL)) + realizedToday;
-    const base = position.symbol.replace(/USDT$/, '').toUpperCase();
-    positions.push({ symbol: `${position.symbol}-${side}`, base: `${base}·${side === 'SHORT' ? 'S' : 'L'}`, exchange: 'bitget', price: mark, change24h: margin > 0 ? pnl / margin * 100 : 0, quoteVolume: 0, high24h: mark, low24h: open, positionValue: total * mark, dailyPnl: pnl });
+    const base = symbol.replace(/USDT$/, '').toUpperCase();
+    positions.push({ symbol: `${symbol}-${side}`, base: `${base}·${side === 'SHORT' ? 'S' : 'L'}`, exchange: 'bitget', price: mark, change24h: margin > 0 ? pnl / margin * 100 : 0, quoteVolume: 0, high24h: mark, low24h: open, positionValue: total * mark, dailyPnl: pnl });
   }
   for (const [symbol, pnl] of realized) {
     if (Math.abs(pnl) < .000001) continue;

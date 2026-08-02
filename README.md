@@ -207,6 +207,8 @@ Enter the API key, API secret, and Bitget API passphrase in **Connect Bitget**. 
 
 Both Bitget Classic Account (`/api/v2/mix`) and Unified Trading Account (`/api/v3`) open-position APIs are supported. If both APIs reject the request, Trading Journal displays the permission error instead of silently showing an empty contract list.
 
+TradingView labels such as `XMRUSDTPERP` are normalized to Bitget REST symbols such as `XMRUSDT`. The position loader requests every USDT futures margin mode, including isolated positions, and can use the public futures ticker when a position response omits its mark price.
+
 ## Trading Notes workflow
 
 1. Open **Trading Notes** from the navigation bar.

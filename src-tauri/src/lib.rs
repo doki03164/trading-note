@@ -197,6 +197,11 @@ fn merge_snapshot(history: &mut Vec<HistoryEntry>, positions: &[PortfolioCoin], 
 
 fn parse_number(value: &str) -> f64 { value.parse::<f64>().unwrap_or(0.0) }
 
+fn canonical_futures_symbol(value: &str) -> String {
+    let upper = value.trim().to_uppercase();
+    upper.strip_suffix("PERP").unwrap_or(&upper).to_string()
+}
+
 fn summarize_futures_balance(accounts: Vec<FuturesAccount>) -> Option<FuturesBalanceSummary> {
     accounts.into_iter().find(|account| account.margin_coin.eq_ignore_ascii_case("USDT")).map(|account| FuturesBalanceSummary {
         margin_coin: account.margin_coin,
@@ -251,7 +256,8 @@ async fn get_tickers() -> Result<Vec<Ticker>, String> {
 
 async fn get_futures(credentials: &BitgetCredentials) -> Result<Vec<FuturesPosition>, String> {
     let path = "/api/v2/mix/position/all-position";
-    let query = "productType=USDT-FUTURES&marginCoin=USDT";
+    // marginCoin is optional; omitting it also returns isolated and multi-asset USDT positions.
+    let query = "productType=USDT-FUTURES";
     let timestamp = timestamp_ms();
     let sign = signature(&credentials.api_secret, &timestamp, "GET", path, query)?;
     let response = Client::new().get(format!("https://api.bitget.com{path}?{query}"))
@@ -403,15 +409,15 @@ async fn portfolio(credentials: &BitgetCredentials) -> Result<PortfolioResponse,
         return Err(format!("Spot: {}; Futures: {}", assets_result.err().unwrap_or_default(), futures_result.err().unwrap_or_default()));
     }
     let assets = assets_result.unwrap_or_default();
-    let futures = futures_result.unwrap_or_default();
+    let futures = futures_result.map_err(|error| format!("Bitget futures positions: {error}"))?;
     let bills = bills_result.unwrap_or_default();
     let futures_balance = accounts_result.ok().and_then(summarize_futures_balance).or_else(|| uta_account_result.ok().map(summarize_uta_balance));
     let ticker_map: HashMap<String, Ticker> = tickers.into_iter().map(|t| (t.symbol.clone(), t)).collect();
-    let futures_ticker_map: HashMap<String, FuturesTicker> = futures_tickers.into_iter().map(|t| (t.symbol.clone(), t)).collect();
+    let futures_ticker_map: HashMap<String, FuturesTicker> = futures_tickers.into_iter().map(|t| (canonical_futures_symbol(&t.symbol), t)).collect();
     let mut realized_by_symbol: HashMap<String, f64> = HashMap::new();
     for bill in bills.into_iter().filter(|b| is_pnl_bill(&b.business_type)) {
         if bill.symbol.is_empty() { continue; }
-        *realized_by_symbol.entry(bill.symbol).or_default() += parse_number(&bill.amount) + parse_number(&bill.fee);
+        *realized_by_symbol.entry(canonical_futures_symbol(&bill.symbol)).or_default() += parse_number(&bill.amount) + parse_number(&bill.fee);
     }
     let mut result = Vec::new();
 
@@ -437,18 +443,20 @@ async fn portfolio(credentials: &BitgetCredentials) -> Result<PortfolioResponse,
     for position in futures {
         let total = parse_number(&position.total);
         let mark_price = parse_number(&position.mark_price);
-        if total <= 0.0 || mark_price <= 0.0 { continue; }
+        if total <= 0.0 { continue; }
         let lifetime_pnl = parse_number(&position.unrealized_pl);
         let margin = parse_number(&position.margin_size);
         let side = position.hold_side.to_uppercase();
-        let base = position.symbol.trim_end_matches("USDT").to_uppercase();
-        let open_utc = futures_ticker_map.get(&position.symbol).map(|t| parse_number(&t.open_utc)).unwrap_or(0.0);
-        let ticker_mark = futures_ticker_map.get(&position.symbol).map(|t| parse_number(&t.mark_price)).unwrap_or(mark_price);
+        let symbol = canonical_futures_symbol(&position.symbol);
+        let base = symbol.trim_end_matches("USDT").to_uppercase();
+        let open_utc = futures_ticker_map.get(&symbol).map(|t| parse_number(&t.open_utc)).unwrap_or(0.0);
+        let ticker_mark = futures_ticker_map.get(&symbol).map(|t| parse_number(&t.mark_price)).unwrap_or(mark_price);
         let mark = if ticker_mark > 0.0 { ticker_mark } else { mark_price };
-        let realized_today = realized_by_symbol.remove(&position.symbol).unwrap_or(0.0);
+        if mark <= 0.0 { continue; }
+        let realized_today = realized_by_symbol.remove(&symbol).unwrap_or(0.0);
         let pnl = futures_daily_pnl(&side, total, mark, open_utc, realized_today, lifetime_pnl);
         result.push(PortfolioCoin {
-            symbol: format!("{}-{}", position.symbol, side),
+            symbol: format!("{}-{}", symbol, side),
             base: format!("{}·{}", base, if side == "SHORT" { "S" } else { "L" }),
             exchange: "bitget".into(),
             price: mark,
@@ -611,5 +619,11 @@ mod tests {
         assert_eq!(position.symbol, "BTCUSDT");
         assert_eq!(position.pos_side, "short");
         assert_eq!(position.position_balance, "120");
+    }
+
+    #[test]
+    fn tradingview_perpetual_symbol_matches_bitget_rest_symbol() {
+        assert_eq!(canonical_futures_symbol("XMRUSDTPERP"), "XMRUSDT");
+        assert_eq!(canonical_futures_symbol("xmrusdt"), "XMRUSDT");
     }
 }
