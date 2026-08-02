@@ -4,7 +4,8 @@ use argon2::Argon2;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use sha2::Sha256;
 use std::{collections::HashMap, sync::Mutex, time::{SystemTime, UNIX_EPOCH}};
 use tauri::Manager;
@@ -25,12 +26,36 @@ struct BitgetState(Mutex<Option<BitgetCredentials>>);
 #[derive(Deserialize)]
 struct ApiResponse<T> { code: String, #[serde(default)] msg: String, data: T }
 
+fn string_or_default<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::String(value)) => value,
+        Some(Value::Number(value)) => value.to_string(),
+        Some(Value::Bool(value)) => value.to_string(),
+        _ => String::new(),
+    })
+}
+
 #[derive(Deserialize)]
 struct Asset { coin: String, available: String, frozen: String, locked: String }
 
-#[derive(Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct FuturesPosition { symbol: String, hold_side: String, margin_size: String, total: String, unrealized_pl: String, mark_price: String }
+struct FuturesPosition {
+    #[serde(default, deserialize_with = "string_or_default")] symbol: String,
+    #[serde(default, deserialize_with = "string_or_default")] hold_side: String,
+    #[serde(default, deserialize_with = "string_or_default")] margin_size: String,
+    #[serde(default, deserialize_with = "string_or_default")] total: String,
+    #[serde(default, deserialize_with = "string_or_default")] unrealized_pl: String,
+    #[serde(default, deserialize_with = "string_or_default")] mark_price: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ClassicPositionData { List(Vec<FuturesPosition>), Wrapped { #[serde(default)] list: Vec<FuturesPosition> } }
+
+impl ClassicPositionData {
+    fn into_positions(self) -> Vec<FuturesPosition> { match self { Self::List(value) => value, Self::Wrapped { list } => list } }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -217,6 +242,28 @@ fn timestamp_ms() -> String {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis().to_string()
 }
 
+fn json_text(value: Option<&Value>) -> String {
+    match value { Some(Value::String(value)) => value.clone(), Some(Value::Number(value)) => value.to_string(), Some(Value::Bool(value)) => value.to_string(), _ => String::new() }
+}
+
+fn parse_bitget_data<T: DeserializeOwned>(body: &str, context: &str) -> Result<T, String> {
+    let envelope: Value = serde_json::from_str(body).map_err(|error| format!("{context}: response is not JSON ({error})"))?;
+    let code = json_text(envelope.get("code"));
+    let msg = json_text(envelope.get("msg"));
+    let message = if msg.is_empty() { json_text(envelope.get("message")) } else { msg };
+    if code != "00000" { return Err(if message.is_empty() { format!("{context} error {code}") } else { format!("{context} {code}: {message}") }); }
+    let data = envelope.get("data").cloned().ok_or_else(|| format!("{context}: success response has no data"))?;
+    serde_json::from_value(data).map_err(|error| format!("{context}: unsupported data format ({error})"))
+}
+
+fn bitget_http_error(context: &str, status: reqwest::StatusCode, body: &str) -> String {
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let code = parsed.as_ref().map(|value| json_text(value.get("code"))).unwrap_or_default();
+    let msg = parsed.as_ref().map(|value| json_text(value.get("msg"))).unwrap_or_default();
+    let message = if msg.is_empty() { parsed.as_ref().map(|value| json_text(value.get("message"))).unwrap_or_default() } else { msg };
+    if message.is_empty() { format!("{context} HTTP {status}") } else { format!("{context} HTTP {status} {code}: {message}") }
+}
+
 fn signature(secret: &str, timestamp: &str, method: &str, path: &str, query: &str) -> Result<String, String> {
     let suffix = if query.is_empty() { String::new() } else { format!("?{query}") };
     let payload = format!("{timestamp}{}{path}{suffix}", method.to_uppercase());
@@ -254,10 +301,8 @@ async fn get_tickers() -> Result<Vec<Ticker>, String> {
     Ok(payload.data)
 }
 
-async fn get_futures(credentials: &BitgetCredentials) -> Result<Vec<FuturesPosition>, String> {
+async fn get_futures_query(credentials: &BitgetCredentials, query: &str) -> Result<Vec<FuturesPosition>, String> {
     let path = "/api/v2/mix/position/all-position";
-    // marginCoin is optional; omitting it also returns isolated and multi-asset USDT positions.
-    let query = "productType=USDT-FUTURES";
     let timestamp = timestamp_ms();
     let sign = signature(&credentials.api_secret, &timestamp, "GET", path, query)?;
     let response = Client::new().get(format!("https://api.bitget.com{path}?{query}"))
@@ -270,10 +315,21 @@ async fn get_futures(credentials: &BitgetCredentials) -> Result<Vec<FuturesPosit
         .send().await.map_err(|e| format!("Bitget futures connection failed: {e}"))?;
     let status = response.status();
     let body = response.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() { return Err(format!("Bitget futures HTTP {status}")); }
-    let payload: ApiResponse<Vec<FuturesPosition>> = serde_json::from_str(&body).map_err(|_| "Invalid Bitget futures response".to_string())?;
-    if payload.code != "00000" { return Err(if payload.msg.is_empty() { format!("Bitget error {}", payload.code) } else { payload.msg }); }
-    Ok(payload.data)
+    if !status.is_success() { return Err(bitget_http_error("Bitget Classic futures", status, &body)); }
+    Ok(parse_bitget_data::<ClassicPositionData>(&body, "Bitget Classic futures")?.into_positions())
+}
+
+async fn get_futures(credentials: &BitgetCredentials) -> Result<Vec<FuturesPosition>, String> {
+    // This documented filter includes isolated USDT positions; the unfiltered call covers multi-asset variants.
+    let filtered = get_futures_query(credentials, "productType=USDT-FUTURES&marginCoin=USDT").await;
+    if filtered.as_ref().is_ok_and(|positions| !positions.is_empty()) { return filtered; }
+    match get_futures_query(credentials, "productType=USDT-FUTURES").await {
+        Ok(positions) => Ok(positions),
+        Err(unfiltered_error) => match filtered {
+            Ok(empty) => Ok(empty),
+            Err(filtered_error) => Err(format!("USDT filter: {filtered_error}; all margins: {unfiltered_error}")),
+        },
+    }
 }
 
 async fn get_uta_futures(credentials: &BitgetCredentials) -> Result<Vec<FuturesPosition>, String> {
@@ -288,10 +344,9 @@ async fn get_uta_futures(credentials: &BitgetCredentials) -> Result<Vec<FuturesP
         .send().await.map_err(|e| format!("Bitget UTA futures connection failed: {e}"))?;
     let status = response.status();
     let body = response.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() { return Err(format!("Bitget UTA futures HTTP {status}")); }
-    let payload: ApiResponse<UtaPositionData> = serde_json::from_str(&body).map_err(|_| "Invalid Bitget UTA futures response".to_string())?;
-    if payload.code != "00000" { return Err(if payload.msg.is_empty() { format!("Bitget UTA error {}", payload.code) } else { payload.msg }); }
-    Ok(payload.data.list.into_iter().map(|position| FuturesPosition {
+    if !status.is_success() { return Err(bitget_http_error("Bitget UTA futures", status, &body)); }
+    let data = parse_bitget_data::<UtaPositionData>(&body, "Bitget UTA futures")?;
+    Ok(data.list.into_iter().map(|position| FuturesPosition {
         symbol: position.symbol, hold_side: position.pos_side, margin_size: position.position_balance,
         total: position.total, unrealized_pl: position.unrealised_pnl, mark_price: position.mark_price,
     }).collect())
@@ -619,6 +674,28 @@ mod tests {
         assert_eq!(position.symbol, "BTCUSDT");
         assert_eq!(position.pos_side, "short");
         assert_eq!(position.position_balance, "120");
+    }
+
+    #[test]
+    fn classic_position_parser_accepts_documented_and_wrapped_data() {
+        let documented = r#"{"code":"00000","msg":"success","data":[{"symbol":"XMRUSDT","holdSide":"long","marginSize":"100","total":"2.67","unrealizedPL":"-10.89","markPrice":"361.69"}]}"#;
+        let positions = parse_bitget_data::<ClassicPositionData>(documented, "Classic").unwrap().into_positions();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, "XMRUSDT");
+        assert_eq!(positions[0].total, "2.67");
+
+        let wrapped = r#"{"code":"00000","msg":"success","data":{"list":[{"symbol":"XMRUSDT","holdSide":"long","marginSize":100,"total":2.67,"unrealizedPL":null}]}}"#;
+        let positions = parse_bitget_data::<ClassicPositionData>(wrapped, "Classic").unwrap().into_positions();
+        assert_eq!(positions[0].margin_size, "100");
+        assert_eq!(positions[0].total, "2.67");
+        assert!(positions[0].unrealized_pl.is_empty());
+        assert!(positions[0].mark_price.is_empty());
+    }
+
+    #[test]
+    fn bitget_error_with_null_data_surfaces_code_and_message() {
+        let error = parse_bitget_data::<ClassicPositionData>(r#"{"code":"40014","msg":"Parameter verification failed","data":null}"#, "Classic").unwrap_err();
+        assert_eq!(error, "Classic 40014: Parameter verification failed");
     }
 
     #[test]

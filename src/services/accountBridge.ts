@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type { FuturesBalance, MarketCoin, PortfolioResponse, ProfitHistoryEntry } from '../types';
 
 interface Credentials { apiKey: string; apiSecret: string; passphrase: string }
-interface ApiEnvelope<T> { code: string; msg?: string; message?: string; data: T }
+interface ApiEnvelope<T> { code: string | number; msg?: string; message?: string; data?: T | null }
 interface SpotAsset { coin: string; available: string; frozen: string; locked: string }
 interface SpotTicker { symbol: string; lastPr: string; openUtc: string; quoteVolume: string; high24h: string; low24h: string }
 interface FuturesPosition { symbol: string; holdSide: string; marginSize: string; total: string; unrealizedPL: string; markPrice: string }
@@ -36,6 +36,18 @@ export async function bitgetSignature(secret: string, timestamp: string, path: s
   return bytesToBase64(new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload))));
 }
 
+export function parseBitgetResponse<T>(raw: unknown, status = 200): T {
+  let payload: ApiEnvelope<T> | undefined;
+  try { payload = (typeof raw === 'string' ? JSON.parse(raw) : raw) as ApiEnvelope<T>; } catch { /* handled below */ }
+  const code = payload?.code == null ? '' : String(payload.code);
+  const apiMessage = payload?.msg || payload?.message;
+  if (status < 200 || status >= 300) throw new Error(apiMessage ? `Bitget HTTP ${status} ${code}: ${apiMessage}` : `Bitget HTTP ${status}`);
+  if (!payload) throw new Error('Bitget response is not JSON');
+  if (code !== '00000') throw new Error(apiMessage || `Bitget error ${code}`);
+  if (payload.data == null) throw new Error('Bitget success response has no data');
+  return payload.data;
+}
+
 async function request<T>(path: string, query = '', credentials?: Credentials): Promise<T> {
   const timestamp = Date.now().toString();
   const headers: Record<string, string> = { Accept: 'application/json', 'Content-Type': 'application/json', locale: 'en-US' };
@@ -46,10 +58,7 @@ async function request<T>(path: string, query = '', credentials?: Credentials): 
     headers['ACCESS-SIGN'] = await bitgetSignature(credentials.apiSecret, timestamp, path, query);
   }
   const response = await CapacitorHttp.request({ method: 'GET', url: `${BASE_URL}${path}${query ? `?${query}` : ''}`, headers });
-  if (response.status < 200 || response.status >= 300) throw new Error(`Bitget HTTP ${response.status}`);
-  const payload = (typeof response.data === 'string' ? JSON.parse(response.data) : response.data) as ApiEnvelope<T>;
-  if (payload.code !== '00000') throw new Error(payload.msg || payload.message || `Bitget error ${payload.code}`);
-  return payload.data;
+  return parseBitgetResponse<T>(response.data, response.status);
 }
 
 function isPnlBill(type: string) {
@@ -60,13 +69,31 @@ export function normalizeUtaPosition(position: UtaFuturesPosition): FuturesPosit
   return { symbol: position.symbol, holdSide: position.posSide, marginSize: position.positionBalance, total: position.total, unrealizedPL: position.unrealisedPnl, markPrice: position.markPrice };
 }
 
+export function classicPositionList(data: FuturesPosition[] | { list?: FuturesPosition[] }) {
+  return Array.isArray(data) ? data : data.list ?? [];
+}
+
 async function mobileFuturesPositions(credentials: Credentials) {
-  const classic = await request<FuturesPosition[]>('/api/v2/mix/position/all-position', 'productType=USDT-FUTURES', credentials).catch(() => undefined);
-  if (classic?.length) return classic;
-  const unified = await request<UtaPositionData>('/api/v3/position/current-position', 'category=USDT-FUTURES', credentials).catch(() => undefined);
-  if (unified) return unified.list.map(normalizeUtaPosition);
-  if (classic) return classic;
-  throw new Error('Futures positions were rejected by both Bitget Classic and Unified Account APIs. Enable futures/UTA read permission.');
+  let filtered: FuturesPosition[] | undefined, filteredError = '';
+  try {
+    filtered = classicPositionList(await request<FuturesPosition[] | { list?: FuturesPosition[] }>('/api/v2/mix/position/all-position', 'productType=USDT-FUTURES&marginCoin=USDT', credentials));
+    if (filtered.length) return filtered;
+  } catch (error) { filteredError = error instanceof Error ? error.message : String(error); }
+
+  let unfiltered: FuturesPosition[] | undefined, unfilteredError = '';
+  try {
+    unfiltered = classicPositionList(await request<FuturesPosition[] | { list?: FuturesPosition[] }>('/api/v2/mix/position/all-position', 'productType=USDT-FUTURES', credentials));
+    if (unfiltered.length) return unfiltered;
+  } catch (error) { unfilteredError = error instanceof Error ? error.message : String(error); }
+
+  let utaError = '';
+  try {
+    const unified = await request<UtaPositionData>('/api/v3/position/current-position', 'category=USDT-FUTURES', credentials);
+    return unified.list.map(normalizeUtaPosition);
+  } catch (error) { utaError = error instanceof Error ? error.message : String(error); }
+  if (unfiltered) return unfiltered;
+  if (filtered) return filtered;
+  throw new Error(`Classic USDT: ${filteredError}; Classic all margins: ${unfilteredError}; Unified: ${utaError}`);
 }
 
 async function mobilePortfolio(credentials: Credentials): Promise<PortfolioResponse> {

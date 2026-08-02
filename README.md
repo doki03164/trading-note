@@ -269,7 +269,7 @@ npm run ios:open        # Open Xcode on macOS
 
 ## Troubleshooting
 
-- **Bitget connection error:** verify the key, secret, API passphrase, IP whitelist, and read permissions.
+- **Bitget connection error:** verify the key, secret, API passphrase, IP whitelist, and read permissions. Futures login first requests the documented Classic USDT form (`productType=USDT-FUTURES&marginCoin=USDT`), then Classic all-margin and UTA compatibility paths. API code/message details are displayed when Bitget rejects a path.
 - **Empty futures balance:** enable futures account and holdings read permissions.
 - **Can't connect to Binance API:** check internet, DNS, firewall, and regional API availability, then retry. The heatmap remains empty rather than displaying generated market data.
 - **Cloud not configured:** create `.env` from `.env.example`, apply the Supabase migration, and rebuild.
