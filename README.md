@@ -163,7 +163,21 @@ For Google Play, create a signing key in Android Studio and use **Build ??Genera
 
 ## Build and install iOS
 
-The iOS build and signing steps run on a Mac:
+The release provides two iOS packages:
+
+1. **Description profile:** `Trading-Journal.mobileconfig` installs a removable Trading Journal Home Screen entry that opens the current release/install page. On iPhone, download the file, open **Settings > Profile Downloaded**, inspect the displayed publisher and payload, then tap **Install**.
+2. **Native IPA:** `Trading-Journal-iOS-unsigned.ipa` is a real arm64 device build packaged for re-signing. Install it with an Apple Account through AltStore/Sideloadly, or sign it with your Apple Developer certificate and provisioning profile before device/MDM distribution. The bundle identifier is `com.pulsegrid.app`.
+
+The description profile is a lightweight release shortcut; the IPA is the full native Trading Journal application. Apple ties native iPhone installation to the installer's signing identity and registered device. The GitHub artifact deliberately contains no shared signing certificate or private key.
+
+To regenerate and validate the description profile locally:
+
+```bash
+npm run ios:profile
+plutil -lint ios/distribution/Trading-Journal.mobileconfig
+```
+
+The iOS source build and signing steps run on a Mac:
 
 ```bash
 npm ci
@@ -183,6 +197,8 @@ In Xcode:
 6. Connect an iPhone, enable Developer Mode on it, choose it as the run destination, and press **Run**.
 
 For TestFlight or the App Store, choose a generic iOS device, select **Product ??Archive**, and distribute the archive through App Store Connect.
+
+Every GitHub Actions run also compiles the simulator target, builds an unsigned arm64 device app, packages `Payload/Trading Journal.app` as an IPA, tests the IPA ZIP, validates its bundle ID/architecture, validates the `.mobileconfig`, and uploads both under the `trading-journal-ios` artifact. Releases attach both files separately.
 
 ## Refresh native projects after frontend changes
 
@@ -246,6 +262,7 @@ npm run build           # TypeScript + production web build
 npm run desktop:dev     # Tauri desktop development
 npm run desktop:build   # Tauri desktop package
 npm run mobile:sync     # Build and sync Android/iOS assets
+npm run ios:profile     # Generate the iOS description profile
 npm run android:open    # Open Android Studio
 npm run ios:open        # Open Xcode on macOS
 ```

@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>FullScreen</key>
+      <true/>
+      <key>Icon</key>
+      <data>
+          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
+          QmCC
+      </data>
+      <key>IsRemovable</key>
+      <true/>
+      <key>Label</key>
+      <string>Trading Journal</string>
+      <key>PayloadDescription</key>
+      <string>在主畫面加入 Trading Journal 安裝及版本入口。</string>
+      <key>PayloadDisplayName</key>
+      <string>Trading Journal</string>
+      <key>PayloadIdentifier</key>
+      <string>com.pulsegrid.app.webclip</string>
+      <key>PayloadOrganization</key>
+      <string>Trading Journal</string>
+      <key>PayloadType</key>
+      <string>com.apple.webClip.managed</string>
+      <key>PayloadUUID</key>
+      <string>0CF47E9A-7FB4-4B11-8F6C-3B04AB18B317</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+      <key>Precomposed</key>
+      <true/>
+      <key>URL</key>
+      <string>https://github.com/doki03164/trading-note/releases/latest</string>
+    </dict>
+  </array>
+  <key>PayloadDescription</key>
+  <string>Trading Journal v0.2.1 描述檔捷徑版；提供最新版本及 iOS 安裝入口。</string>
+  <key>PayloadDisplayName</key>
+  <string>Trading Journal</string>
+  <key>PayloadIdentifier</key>
+  <string>com.pulsegrid.app.profile</string>
+  <key>PayloadOrganization</key>
+  <string>Trading Journal</string>
+  <key>PayloadRemovalDisallowed</key>
+  <false/>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadUUID</key>
+  <string>C43BC926-46F0-48EE-B809-A5F8F86B33FA</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+</dict>
+</plist>

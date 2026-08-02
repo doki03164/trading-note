@@ -11,6 +11,7 @@
     "desktop:dev": "tauri dev",
     "desktop:build": "tauri build",
     "mobile:sync": "npm run build && cap sync",
+    "ios:profile": "node scripts/generate-ios-profile.mjs",
     "ios:open": "npm run mobile:sync && cap open ios",
     "android:open": "npm run mobile:sync && cap open android"
   },
