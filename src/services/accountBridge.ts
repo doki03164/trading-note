@@ -13,7 +13,10 @@ interface UtaAsset { coin: string; balance: string; available: string; locked: s
 interface UtaAccountData { accountEquity: string; usdtEquity: string; unrealisedPnl: string; usdtUnrealisedPnl: string; assets: UtaAsset[] }
 interface FuturesTicker { symbol: string; openUtc: string; markPrice: string }
 interface FuturesBill { symbol: string; amount: string; fee: string; businessType: string }
-interface FuturesAccount { marginCoin: string; available?: string; locked?: string; accountEquity?: string; unrealizedPL?: string; maxTransferOut?: string }
+interface FuturesBillData { bills: FuturesBill[]; endId?: string }
+interface UtaFinancialRecord { symbol?: string; amount?: string; fee?: string; type?: string }
+interface UtaFinancialData { list: UtaFinancialRecord[]; cursor?: string }
+interface FuturesAccount { marginCoin: string; available?: string; locked?: string; accountEquity?: string; unrealizedPL?: string; crossedUnrealizedPL?: string; isolatedUnrealizedPL?: string; maxTransferOut?: string }
 interface MobileVault { salt: string; iv: string; ciphertext: string }
 
 const BASE_URL = 'https://api.bitget.com';
@@ -62,8 +65,15 @@ async function request<T>(path: string, query = '', credentials?: Credentials): 
 }
 
 function isPnlBill(type: string) {
-  return !type.startsWith('trans_') && !['append_margin', 'adjust_down_lever_append_margin', 'reduce_margin', 'auto_append_margin', 'cash_gift_issue', 'cash_gift_recycle', 'bonus_issue', 'bonus_recycle', 'bonus_expired'].includes(type);
+  const value = type.toLowerCase();
+  return !value.startsWith('trans_') && !value.startsWith('transfer_') && !value.startsWith('user_exchange_') && !['append_margin', 'adjust_down_lever_append_margin', 'reduce_margin', 'auto_append_margin', 'cash_gift_issue', 'cash_gift_recycle', 'bonus_issue', 'bonus_recycle', 'bonus_expired', 'risk_captital_user_transfer', 'risk_capital_user_transfer'].includes(value);
 }
+
+export function futuresAccountUnrealized(account: FuturesAccount) {
+  return account.unrealizedPL?.trim() ? number(account.unrealizedPL) : number(account.crossedUnrealizedPL) + number(account.isolatedUnrealizedPL);
+}
+
+export function actualFuturesPnl(unrealizedPnl: number, realizedPnl?: number | null) { return unrealizedPnl + (realizedPnl ?? 0); }
 
 export function normalizeUtaPosition(position: UtaFuturesPosition): FuturesPosition {
   return { symbol: position.symbol, holdSide: position.posSide, marginSize: position.positionBalance, total: position.total, unrealizedPL: position.unrealisedPnl, markPrice: position.markPrice };
@@ -96,14 +106,54 @@ async function mobileFuturesPositions(credentials: Credentials) {
   throw new Error(`Classic USDT: ${filteredError}; Classic all margins: ${unfilteredError}; Unified: ${utaError}`);
 }
 
+async function classicFuturesBills(credentials: Credentials, dayStart: number, now: number) {
+  const bills: FuturesBill[] = [];
+  let cursor = '';
+  const seen = new Set<string>();
+  for (let page = 0; page < 100; page += 1) {
+    const query = `productType=USDT-FUTURES&startTime=${dayStart}&endTime=${now}&limit=100${cursor ? `&idLessThan=${encodeURIComponent(cursor)}` : ''}`;
+    const data = await request<FuturesBillData>('/api/v2/mix/account/bill', query, credentials);
+    bills.push(...data.bills);
+    if (data.bills.length < 100 || !data.endId) return bills;
+    if (seen.has(data.endId)) throw new Error('Bitget Classic bills returned a repeated pagination cursor');
+    seen.add(data.endId);
+    cursor = data.endId;
+  }
+  throw new Error('Bitget Classic bills exceeded 10,000 UTC-day records');
+}
+
+async function utaFuturesBills(credentials: Credentials, dayStart: number, now: number) {
+  const bills: FuturesBill[] = [];
+  let cursor = '';
+  const seen = new Set<string>();
+  for (let page = 0; page < 100; page += 1) {
+    const query = `category=USDT-FUTURES&startTime=${dayStart}&endTime=${now}&limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
+    const data = await request<UtaFinancialData>('/api/v3/account/financial-records', query, credentials);
+    bills.push(...data.list.map(record => ({ symbol: record.symbol ?? '', amount: record.amount ?? '0', fee: record.fee ?? '0', businessType: record.type ?? '' })));
+    if (data.list.length < 100 || !data.cursor) return bills;
+    if (seen.has(data.cursor)) throw new Error('Bitget UTA records returned a repeated pagination cursor');
+    seen.add(data.cursor);
+    cursor = data.cursor;
+  }
+  throw new Error('Bitget UTA records exceeded 10,000 UTC-day records');
+}
+
+async function mobileFuturesBills(credentials: Credentials, dayStart: number, now: number) {
+  try { return await classicFuturesBills(credentials, dayStart, now); }
+  catch (classicError) {
+    try { return await utaFuturesBills(credentials, dayStart, now); }
+    catch (utaError) { throw new Error(`Classic bills: ${String(classicError)}; UTA records: ${String(utaError)}`); }
+  }
+}
+
 async function mobilePortfolio(credentials: Credentials): Promise<PortfolioResponse> {
-  const dayStart = Date.now() - Date.now() % 86_400_000;
+  const now = Date.now(), dayStart = now - now % 86_400_000;
   const [tickers, futuresTickers, classicAssets, futuresResult, billsResult, classicAccounts, utaAccount] = await Promise.all([
     request<SpotTicker[]>('/api/v2/spot/market/tickers'),
     request<FuturesTicker[]>('/api/v2/mix/market/tickers', 'productType=USDT-FUTURES'),
     request<SpotAsset[]>('/api/v2/spot/account/assets', 'assetType=hold_only', credentials).catch(() => []),
     mobileFuturesPositions(credentials),
-    request<{ bills: FuturesBill[] }>('/api/v2/mix/account/bill', `productType=USDT-FUTURES&startTime=${dayStart}&endTime=${Date.now()}&limit=100`, credentials).catch(() => ({ bills: [] })),
+    mobileFuturesBills(credentials, dayStart, now).then(value => ({ value, available: true })).catch(() => ({ value: [] as FuturesBill[], available: false })),
     request<FuturesAccount[]>('/api/v2/mix/account/accounts', 'productType=USDT-FUTURES', credentials).catch(() => []),
     request<UtaAccountData>('/api/v3/account/assets', '', credentials).catch(() => undefined),
   ]);
@@ -113,7 +163,9 @@ async function mobilePortfolio(credentials: Credentials): Promise<PortfolioRespo
   const tickerMap = new Map(tickers.map(ticker => [ticker.symbol, ticker]));
   const futuresTickerMap = new Map(futuresTickers.map(ticker => [canonicalFuturesSymbol(ticker.symbol), ticker]));
   const realized = new Map<string, number>();
-  for (const bill of billsResult.bills.filter(bill => isPnlBill(bill.businessType))) {
+  const pnlBills = billsResult.value.filter(bill => isPnlBill(bill.businessType));
+  const realizedTotal = pnlBills.reduce((sum, bill) => sum + number(bill.amount) + number(bill.fee), 0);
+  for (const bill of pnlBills) {
     if (bill.symbol) { const symbol = canonicalFuturesSymbol(bill.symbol); realized.set(symbol, (realized.get(symbol) ?? 0) + number(bill.amount) + number(bill.fee)); }
   }
 
@@ -123,14 +175,14 @@ async function mobilePortfolio(credentials: Credentials): Promise<PortfolioRespo
     const quantity = number(asset.available) + number(asset.frozen) + number(asset.locked);
     if (quantity <= 0) continue;
     if (base === 'USDT' || base === 'USDC') {
-      positions.push({ symbol: `${base}USDT`, base, exchange: 'bitget', price: 1, change24h: 0, quoteVolume: 0, high24h: 1, low24h: 1, positionValue: quantity, dailyPnl: 0 });
+      positions.push({ symbol: `${base}USDT`, base, exchange: 'bitget', price: 1, change24h: 0, quoteVolume: 0, high24h: 1, low24h: 1, positionValue: quantity, dailyPnl: 0, pnlSource: 'not-applicable' });
       continue;
     }
     const ticker = tickerMap.get(`${base}USDT`);
     if (!ticker) continue;
     const price = number(ticker.lastPr), open = number(ticker.openUtc), value = quantity * price;
     if (price <= 0 || value < .01) continue;
-    positions.push({ symbol: `${base}USDT`, base, exchange: 'bitget', price, change24h: open > 0 ? (price / open - 1) * 100 : 0, quoteVolume: number(ticker.quoteVolume), high24h: number(ticker.high24h), low24h: number(ticker.low24h), positionValue: value, dailyPnl: open > 0 ? quantity * (price - open) : 0 });
+    positions.push({ symbol: `${base}USDT`, base, exchange: 'bitget', price, change24h: open > 0 ? (price / open - 1) * 100 : 0, quoteVolume: number(ticker.quoteVolume), high24h: number(ticker.high24h), low24h: number(ticker.low24h), positionValue: value, dailyPnl: 0, pnlSource: 'not-applicable' });
   }
   for (const position of futuresResult) {
     const total = number(position.total), margin = number(position.marginSize);
@@ -139,33 +191,41 @@ async function mobilePortfolio(credentials: Credentials): Promise<PortfolioRespo
     const mark = number(ticker?.markPrice) || number(position.markPrice), open = number(ticker?.openUtc);
     if (total <= 0 || mark <= 0) continue;
     const side = position.holdSide.toUpperCase();
+    const unrealizedPnl = number(position.unrealizedPL);
     const realizedToday = realized.get(symbol) ?? 0;
     realized.delete(symbol);
-    const pnl = (open > 0 ? total * (side === 'SHORT' ? open - mark : mark - open) : number(position.unrealizedPL)) + realizedToday;
+    const realizedPnl = billsResult.available ? realizedToday : undefined;
+    const pnl = actualFuturesPnl(unrealizedPnl, realizedPnl);
     const base = symbol.replace(/USDT$/, '').toUpperCase();
-    positions.push({ symbol: `${symbol}-${side}`, base: `${base}·${side === 'SHORT' ? 'S' : 'L'}`, exchange: 'bitget', price: mark, change24h: margin > 0 ? pnl / margin * 100 : 0, quoteVolume: 0, high24h: mark, low24h: open, positionValue: total * mark, dailyPnl: pnl });
+    positions.push({ symbol: `${symbol}-${side}`, base: `${base}·${side === 'SHORT' ? 'S' : 'L'}`, exchange: 'bitget', price: mark, change24h: margin > 0 ? unrealizedPnl / margin * 100 : 0, quoteVolume: 0, high24h: mark, low24h: open, positionValue: total * mark, dailyPnl: pnl, unrealizedPnl, realizedPnl, pnlSource: 'exchange' });
   }
   for (const [symbol, pnl] of realized) {
     if (Math.abs(pnl) < .000001) continue;
     const mark = number(futuresTickerMap.get(symbol)?.markPrice), base = symbol.replace(/USDT$/, '').toUpperCase();
-    positions.push({ symbol: `${symbol}-CLOSED`, base: `${base}·R`, exchange: 'bitget', price: mark, change24h: 0, quoteVolume: 0, high24h: mark, low24h: mark, positionValue: Math.max(Math.abs(pnl), 1), dailyPnl: pnl });
+    positions.push({ symbol: `${symbol}-CLOSED`, base: `${base}·R`, exchange: 'bitget', price: mark, change24h: 0, quoteVolume: 0, high24h: mark, low24h: mark, positionValue: Math.max(Math.abs(pnl), 1), dailyPnl: pnl, unrealizedPnl: 0, realizedPnl: pnl, pnlSource: 'exchange' });
   }
   positions.sort((a, b) => b.positionValue - a.positionValue);
 
   const account = classicAccounts.find(item => item.marginCoin.toUpperCase() === 'USDT');
   const utaUsdt = utaAccount?.assets.find(asset => asset.coin.toUpperCase() === 'USDT');
+  const positionUnrealized = futuresResult.reduce((sum, position) => sum + number(position.unrealizedPL), 0);
   const futuresBalance: FuturesBalance | undefined = account
-    ? { marginCoin: account.marginCoin, available: number(account.available), locked: number(account.locked), accountEquity: number(account.accountEquity), unrealizedPnl: number(account.unrealizedPL), maxTransferOut: number(account.maxTransferOut) }
-    : utaAccount ? { marginCoin: 'USDT', available: number(utaUsdt?.available), locked: number(utaUsdt?.locked), accountEquity: number(utaAccount.usdtEquity || utaAccount.accountEquity), unrealizedPnl: number(utaAccount.usdtUnrealisedPnl || utaAccount.unrealisedPnl), maxTransferOut: number(utaUsdt?.available) } : undefined;
+    ? { marginCoin: account.marginCoin, available: number(account.available), locked: number(account.locked), accountEquity: number(account.accountEquity), unrealizedPnl: futuresResult.length ? positionUnrealized : futuresAccountUnrealized(account), realizedPnl: billsResult.available ? realizedTotal : null, maxTransferOut: number(account.maxTransferOut) }
+    : utaAccount ? { marginCoin: 'USDT', available: number(utaUsdt?.available), locked: number(utaUsdt?.locked), accountEquity: number(utaAccount.usdtEquity || utaAccount.accountEquity), unrealizedPnl: futuresResult.length ? positionUnrealized : number(utaAccount.usdtUnrealisedPnl || utaAccount.unrealisedPnl), realizedPnl: billsResult.available ? realizedTotal : null, maxTransferOut: number(utaUsdt?.available) } : undefined;
   return { positions, futuresBalance };
 }
 
 function readMobileHistory(): ProfitHistoryEntry[] {
   try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]') as ProfitHistoryEntry[]; } catch { return []; }
 }
-function saveMobileSnapshot(positions: MarketCoin[]) {
+function saveMobileSnapshot(snapshot: PortfolioResponse) {
+  const positions = snapshot.positions;
   const history = readMobileHistory(), timestamp = Date.now();
-  const entry: ProfitHistoryEntry = { timestamp, totalPnl: positions.reduce((sum, item) => sum + item.dailyPnl, 0), portfolioValue: positions.reduce((sum, item) => sum + item.positionValue, 0), positions };
+  const unrealizedPnl = snapshot.futuresBalance?.unrealizedPnl ?? positions.reduce((sum, item) => sum + (item.unrealizedPnl ?? 0), 0);
+  const realizedValues = positions.filter(item => item.realizedPnl != null).map(item => item.realizedPnl!);
+  const balanceRealized = snapshot.futuresBalance?.realizedPnl;
+  const realizedPnl = balanceRealized != null ? balanceRealized : realizedValues.length ? realizedValues.reduce((sum, value) => sum + value, 0) : null;
+  const entry: ProfitHistoryEntry = { timestamp, totalPnl: unrealizedPnl + (realizedPnl ?? 0), unrealizedPnl, realizedPnl, portfolioValue: positions.reduce((sum, item) => sum + item.positionValue, 0), positions };
   if (history.at(-1)?.timestamp && Math.floor(history.at(-1)!.timestamp / 300_000) === Math.floor(timestamp / 300_000)) history.pop();
   history.push(entry);
   localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(-10_000)));
@@ -194,18 +254,18 @@ async function openMobileVault(password: string): Promise<Credentials> {
 
 export async function connectBitgetAccount(credentials: Credentials, saveLogin: boolean, loginPassword?: string | null) {
   if (isTauriDesktop()) return invoke<PortfolioResponse>('connect_bitget', { ...credentials, saveLogin, loginPassword });
-  const snapshot = await mobilePortfolio(credentials); mobileCredentials = credentials; saveMobileSnapshot(snapshot.positions);
+  const snapshot = await mobilePortfolio(credentials); mobileCredentials = credentials; saveMobileSnapshot(snapshot);
   if (saveLogin) await saveMobileVault(credentials, loginPassword ?? '');
   return snapshot;
 }
 export async function loginBitgetAccount(loginPassword: string) {
   if (isTauriDesktop()) return invoke<PortfolioResponse>('login_bitget', { loginPassword });
-  const credentials = await openMobileVault(loginPassword), snapshot = await mobilePortfolio(credentials); mobileCredentials = credentials; saveMobileSnapshot(snapshot.positions); return snapshot;
+  const credentials = await openMobileVault(loginPassword), snapshot = await mobilePortfolio(credentials); mobileCredentials = credentials; saveMobileSnapshot(snapshot); return snapshot;
 }
 export async function refreshBitgetAccount() {
   if (isTauriDesktop()) return invoke<PortfolioResponse>('refresh_bitget');
   if (!mobileCredentials) throw new Error('Bitget is not connected');
-  const snapshot = await mobilePortfolio(mobileCredentials); saveMobileSnapshot(snapshot.positions); return snapshot;
+  const snapshot = await mobilePortfolio(mobileCredentials); saveMobileSnapshot(snapshot); return snapshot;
 }
 export async function disconnectBitgetAccount() { if (isTauriDesktop()) await invoke('disconnect_bitget'); mobileCredentials = undefined; }
 export async function hasSavedBitgetLogin() { return isTauriDesktop() ? invoke<boolean>('has_saved_login') : Boolean(localStorage.getItem(VAULT_KEY)); }

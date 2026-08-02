@@ -15,7 +15,7 @@ export async function fetchBinance(signal?: AbortSignal): Promise<MarketCoin[]> 
     .map(r => ({ symbol: r.symbol, base: r.symbol.slice(0, -4), exchange: 'binance' as const, price: +r.lastPrice, change24h: +r.priceChangePercent, quoteVolume: +r.quoteVolume, high24h: +r.highPrice, low24h: +r.lowPrice }))
     .filter(r => Number.isFinite(r.price) && r.price > 0)
     .sort((a, b) => b.quoteVolume - a.quoteVolume).slice(0, 40)
-    .map(coin => ({ ...coin, positionValue: coin.quoteVolume, dailyPnl: coin.change24h }));
+    .map(coin => ({ ...coin, positionValue: coin.quoteVolume, dailyPnl: coin.change24h, pnlSource: 'market-change' as const }));
 }
 
 export async function fetchBitget(signal?: AbortSignal): Promise<MarketCoin[]> {
@@ -26,7 +26,7 @@ export async function fetchBitget(signal?: AbortSignal): Promise<MarketCoin[]> {
     .map(r => ({ symbol: r.symbol, base: r.symbol.slice(0, -4), exchange: 'bitget' as const, price: +r.lastPr, change24h: +r.change24h * 100, quoteVolume: +r.quoteVolume, high24h: +r.high24h, low24h: +r.low24h }))
     .filter(r => Number.isFinite(r.price) && r.price > 0)
     .sort((a, b) => b.quoteVolume - a.quoteVolume).slice(0, 40)
-    .map(coin => ({ ...coin, positionValue: coin.quoteVolume, dailyPnl: coin.change24h }));
+    .map(coin => ({ ...coin, positionValue: coin.quoteVolume, dailyPnl: coin.change24h, pnlSource: 'market-change' as const }));
 }
 
 export async function fetchMarkets(exchange: Exchange, signal?: AbortSignal): Promise<{ data: MarketCoin[]; live: boolean }> {

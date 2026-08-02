@@ -16,22 +16,25 @@ function fmtPrice(price: number) {
 }
 
 export function HeatMap({ data, sizeMetric, selected, onSelect, valueMode = 'pnl' }: Props) {
-  const max = Math.max(...data.map(d => sizeMetric === 'position' ? d.positionValue : Math.abs(d.dailyPnl)), 1);
+  const pnlValue = (coin: MarketCoin) => valueMode === 'pnl' && coin.pnlSource === 'not-applicable' ? 0 : coin.dailyPnl;
+  const max = Math.max(...data.map(d => sizeMetric === 'position' ? d.positionValue : Math.abs(pnlValue(d))), 1);
   return (
     <div className="heat-grid" aria-label="Market heat map">
       {data.slice(0, 24).map((coin, index) => {
-        const metric = sizeMetric === 'position' ? coin.positionValue : Math.abs(coin.dailyPnl);
+        const pnl = pnlValue(coin);
+        const unavailable = valueMode === 'pnl' && coin.pnlSource === 'not-applicable';
+        const metric = sizeMetric === 'position' ? coin.positionValue : Math.abs(pnl);
         const weight = 0.78 + (metric / max) * 1.8;
         return (
           <button
             key={coin.symbol}
             className={`heat-tile tile-${Math.min(index, 11)} ${selected?.symbol === coin.symbol ? 'selected' : ''}`}
-            style={{ background: color(coin.dailyPnl, coin.positionValue), flexGrow: weight }}
+            style={{ background: unavailable ? '#1a1f23' : color(pnl, coin.positionValue), flexGrow: weight }}
             onClick={() => onSelect(coin)}
           >
             <span className="coin-symbol">{coin.base}</span>
             <span className="coin-price">{fmtPrice(coin.price)}</span>
-            <span className={`coin-pnl ${coin.dailyPnl >= 0 ? 'up' : 'down'}`}>{coin.dailyPnl >= 0 ? '+' : '−'}{valueMode === 'pnl' ? '$' : ''}{Math.abs(coin.dailyPnl).toLocaleString(undefined, { maximumFractionDigits: valueMode === 'pnl' ? 0 : 2 })}{valueMode === 'change' ? '%' : ''}</span>
+            <span className={`coin-pnl ${pnl >= 0 ? 'up' : 'down'}`}>{unavailable ? 'P&L N/A' : <>{pnl >= 0 ? '+' : '−'}{valueMode === 'pnl' ? '$' : ''}{Math.abs(pnl).toLocaleString(undefined, { maximumFractionDigits: valueMode === 'pnl' ? 2 : 2 })}{valueMode === 'change' ? '%' : ''}</>}</span>
             <span className="coin-change">{coin.change24h >= 0 ? '+' : ''}{coin.change24h.toFixed(2)}%</span>
           </button>
         );

@@ -117,7 +117,7 @@
     </dict>
   </array>
   <key>PayloadDescription</key>
-  <string>Trading Journal v0.2.2 描述檔捷徑版；提供最新版本及 iOS 安裝入口。</string>
+  <string>Trading Journal v0.2.3 描述檔捷徑版；提供最新版本及 iOS 安裝入口。</string>
   <key>PayloadDisplayName</key>
   <string>Trading Journal</string>
   <key>PayloadIdentifier</key>

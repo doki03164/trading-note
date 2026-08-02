@@ -28,7 +28,7 @@ export function useMarkets(exchange: Exchange) {
 
   useEffect(() => {
     refresh();
-    const timer = window.setInterval(refresh, 30_000);
+    const timer = window.setInterval(refresh, 10_000);
     return () => { window.clearInterval(timer); controller.current?.abort(); };
   }, [refresh]);
 

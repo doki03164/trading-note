@@ -7,7 +7,7 @@ use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
-use std::{collections::HashMap, sync::Mutex, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet}, sync::Mutex, time::{SystemTime, UNIX_EPOCH}};
 use tauri::Manager;
 use zeroize::Zeroize;
 
@@ -77,11 +77,22 @@ struct UtaAccountData { #[serde(default)] account_equity: String, #[serde(defaul
 struct FuturesTicker { symbol: String, open_utc: String, mark_price: String }
 
 #[derive(Deserialize)]
-struct FuturesBillData { bills: Vec<FuturesBill> }
+struct FuturesBillData { bills: Vec<FuturesBill>, #[serde(default)] end_id: String }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FuturesBill { symbol: String, amount: String, fee: String, business_type: String }
+
+#[derive(Deserialize)]
+struct UtaFinancialData { #[serde(default)] list: Vec<UtaFinancialRecord>, #[serde(default)] cursor: String }
+
+#[derive(Deserialize)]
+struct UtaFinancialRecord {
+    #[serde(default)] symbol: String,
+    #[serde(default)] amount: String,
+    #[serde(default)] fee: String,
+    #[serde(rename = "type", default)] business_type: String,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,6 +102,8 @@ struct FuturesAccount {
     #[serde(default)] locked: String,
     #[serde(default)] account_equity: String,
     #[serde(default)] unrealized_pl: String,
+    #[serde(default)] crossed_unrealized_pl: String,
+    #[serde(default)] isolated_unrealized_pl: String,
     #[serde(default)] max_transfer_out: String,
 }
 
@@ -111,6 +124,9 @@ struct PortfolioCoin {
     low24h: f64,
     position_value: f64,
     daily_pnl: f64,
+    #[serde(default)] unrealized_pnl: Option<f64>,
+    #[serde(default)] realized_pnl: Option<f64>,
+    #[serde(default)] pnl_source: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -121,6 +137,7 @@ struct FuturesBalanceSummary {
     locked: f64,
     account_equity: f64,
     unrealized_pnl: f64,
+    realized_pnl: Option<f64>,
     max_transfer_out: f64,
 }
 
@@ -136,6 +153,8 @@ struct PortfolioResponse {
 struct HistoryEntry {
     timestamp: u128,
     total_pnl: f64,
+    #[serde(default)] unrealized_pnl: f64,
+    #[serde(default)] realized_pnl: Option<f64>,
     portfolio_value: f64,
     positions: Vec<PortfolioCoin>,
 }
@@ -199,18 +218,23 @@ fn read_history(app: &tauri::AppHandle) -> Result<Vec<HistoryEntry>, String> {
     serde_json::from_str(&data).map_err(|e| format!("History file error: {e}"))
 }
 
-fn save_snapshot(app: &tauri::AppHandle, positions: &[PortfolioCoin]) -> Result<(), String> {
+fn save_snapshot(app: &tauri::AppHandle, positions: &[PortfolioCoin], balance: Option<&FuturesBalanceSummary>) -> Result<(), String> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
     let mut history = read_history(app).unwrap_or_default();
-    merge_snapshot(&mut history, positions, now);
+    merge_snapshot(&mut history, positions, balance, now);
     let json = serde_json::to_string(&history).map_err(|e| e.to_string())?;
     std::fs::write(history_path(app)?, json).map_err(|e| e.to_string())
 }
 
-fn merge_snapshot(history: &mut Vec<HistoryEntry>, positions: &[PortfolioCoin], now: u128) {
+fn merge_snapshot(history: &mut Vec<HistoryEntry>, positions: &[PortfolioCoin], balance: Option<&FuturesBalanceSummary>, now: u128) {
+    let unrealized_pnl = balance.map(|value| value.unrealized_pnl).unwrap_or_else(|| positions.iter().filter_map(|p| p.unrealized_pnl).sum());
+    let realized_values: Vec<f64> = positions.iter().filter_map(|p| p.realized_pnl).collect();
+    let realized_pnl = balance.and_then(|value| value.realized_pnl).or_else(|| if realized_values.is_empty() { None } else { Some(realized_values.iter().sum()) });
     let entry = HistoryEntry {
         timestamp: now,
-        total_pnl: positions.iter().map(|p| p.daily_pnl).sum(),
+        total_pnl: unrealized_pnl + realized_pnl.unwrap_or(0.0),
+        unrealized_pnl,
+        realized_pnl,
         portfolio_value: positions.iter().map(|p| p.position_value).sum(),
         positions: positions.to_vec(),
     };
@@ -233,7 +257,8 @@ fn summarize_futures_balance(accounts: Vec<FuturesAccount>) -> Option<FuturesBal
         available: parse_number(&account.available),
         locked: parse_number(&account.locked),
         account_equity: parse_number(&account.account_equity),
-        unrealized_pnl: parse_number(&account.unrealized_pl),
+        unrealized_pnl: if account.unrealized_pl.trim().is_empty() { parse_number(&account.crossed_unrealized_pl) + parse_number(&account.isolated_unrealized_pl) } else { parse_number(&account.unrealized_pl) },
+        realized_pnl: None,
         max_transfer_out: parse_number(&account.max_transfer_out),
     })
 }
@@ -385,6 +410,7 @@ fn summarize_uta_balance(account: UtaAccountData) -> FuturesBalanceSummary {
         locked: usdt.map(|asset| parse_number(&asset.locked)).unwrap_or(0.0),
         account_equity: parse_number(if account.usdt_equity.is_empty() { &account.account_equity } else { &account.usdt_equity }),
         unrealized_pnl: parse_number(if account.usdt_unrealised_pnl.is_empty() { &account.unrealised_pnl } else { &account.usdt_unrealised_pnl }),
+        realized_pnl: None,
         max_transfer_out: usdt.map(|asset| parse_number(&asset.available)).unwrap_or(0.0),
     }
 }
@@ -418,43 +444,79 @@ async fn get_futures_tickers() -> Result<Vec<FuturesTicker>, String> {
     Ok(payload.data)
 }
 
-fn utc_day_start_ms() -> u128 {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
-    now - (now % 86_400_000)
-}
-
 fn is_pnl_bill(business_type: &str) -> bool {
-    !business_type.starts_with("trans_") && !matches!(business_type,
+    let value = business_type.to_lowercase();
+    !value.starts_with("trans_") && !value.starts_with("transfer_") && !value.starts_with("user_exchange_") && !matches!(value.as_str(),
         "append_margin" | "adjust_down_lever_append_margin" | "reduce_margin" | "auto_append_margin" |
-        "cash_gift_issue" | "cash_gift_recycle" | "bonus_issue" | "bonus_recycle" | "bonus_expired"
+        "cash_gift_issue" | "cash_gift_recycle" | "bonus_issue" | "bonus_recycle" | "bonus_expired" |
+        "risk_captital_user_transfer" | "risk_capital_user_transfer"
     )
 }
 
-fn futures_daily_pnl(side: &str, total: f64, mark: f64, open_utc: f64, realized_today: f64, lifetime_pnl: f64) -> f64 {
-    let mark_to_market = if open_utc > 0.0 {
-        if side == "SHORT" { total * (open_utc - mark) } else { total * (mark - open_utc) }
-    } else { lifetime_pnl };
-    mark_to_market + realized_today
-}
+fn futures_net_pnl(unrealized_pnl: f64, realized_pnl: Option<f64>) -> f64 { unrealized_pnl + realized_pnl.unwrap_or(0.0) }
 
-async fn get_futures_bills(credentials: &BitgetCredentials) -> Result<Vec<FuturesBill>, String> {
-    let path = "/api/v2/mix/account/bill";
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
-    let query = format!("productType=USDT-FUTURES&startTime={}&endTime={now}&limit=100", utc_day_start_ms());
+async fn get_signed_data<T: DeserializeOwned>(credentials: &BitgetCredentials, path: &str, query: &str, context: &str) -> Result<T, String> {
     let timestamp = timestamp_ms();
-    let sign = signature(&credentials.api_secret, &timestamp, "GET", path, &query)?;
-    let response = Client::new().get(format!("https://api.bitget.com{path}?{query}"))
+    let sign = signature(&credentials.api_secret, &timestamp, "GET", path, query)?;
+    let url = if query.is_empty() { format!("https://api.bitget.com{path}") } else { format!("https://api.bitget.com{path}?{query}") };
+    let response = Client::new().get(url)
         .header("ACCESS-KEY", &credentials.api_key)
         .header("ACCESS-SIGN", sign)
         .header("ACCESS-PASSPHRASE", &credentials.passphrase)
         .header("ACCESS-TIMESTAMP", timestamp)
         .header("Content-Type", "application/json")
         .header("locale", "en-US")
-        .send().await.map_err(|e| format!("Bitget bills connection failed: {e}"))?;
+        .send().await.map_err(|e| format!("{context} connection failed: {e}"))?;
+    let status = response.status();
     let body = response.text().await.map_err(|e| e.to_string())?;
-    let payload: ApiResponse<FuturesBillData> = serde_json::from_str(&body).map_err(|_| "Invalid Bitget bills response".to_string())?;
-    if payload.code != "00000" { return Err(if payload.msg.is_empty() { format!("Bitget error {}", payload.code) } else { payload.msg }); }
-    Ok(payload.data.bills)
+    if !status.is_success() { return Err(bitget_http_error(context, status, &body)); }
+    parse_bitget_data::<T>(&body, context)
+}
+
+async fn get_classic_futures_bills(credentials: &BitgetCredentials, start: u128, end: u128) -> Result<Vec<FuturesBill>, String> {
+    let path = "/api/v2/mix/account/bill";
+    let mut bills = Vec::new();
+    let mut cursor = String::new();
+    let mut seen = HashSet::new();
+    for _ in 0..100 {
+        let cursor_query = if cursor.is_empty() { String::new() } else { format!("&idLessThan={cursor}") };
+        let query = format!("productType=USDT-FUTURES&startTime={start}&endTime={end}&limit=100{cursor_query}");
+        let page: FuturesBillData = get_signed_data(credentials, path, &query, "Bitget Classic bills").await?;
+        let page_len = page.bills.len();
+        bills.extend(page.bills);
+        if page_len < 100 || page.end_id.is_empty() { return Ok(bills); }
+        if !seen.insert(page.end_id.clone()) { return Err("Bitget Classic bills returned a repeated pagination cursor".into()); }
+        cursor = page.end_id;
+    }
+    Err("Bitget Classic bills exceeded 10,000 UTC-day records".into())
+}
+
+async fn get_uta_futures_bills(credentials: &BitgetCredentials, start: u128, end: u128) -> Result<Vec<FuturesBill>, String> {
+    let path = "/api/v3/account/financial-records";
+    let mut bills = Vec::new();
+    let mut cursor = String::new();
+    let mut seen = HashSet::new();
+    for _ in 0..100 {
+        let cursor_query = if cursor.is_empty() { String::new() } else { format!("&cursor={cursor}") };
+        let query = format!("category=USDT-FUTURES&startTime={start}&endTime={end}&limit=100{cursor_query}");
+        let page: UtaFinancialData = get_signed_data(credentials, path, &query, "Bitget UTA financial records").await?;
+        let page_len = page.list.len();
+        bills.extend(page.list.into_iter().map(|record| FuturesBill { symbol: record.symbol, amount: record.amount, fee: record.fee, business_type: record.business_type }));
+        if page_len < 100 || page.cursor.is_empty() { return Ok(bills); }
+        if !seen.insert(page.cursor.clone()) { return Err("Bitget UTA records returned a repeated pagination cursor".into()); }
+        cursor = page.cursor;
+    }
+    Err("Bitget UTA records exceeded 10,000 UTC-day records".into())
+}
+
+async fn get_futures_bills(credentials: &BitgetCredentials) -> Result<Vec<FuturesBill>, String> {
+    let end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+    let start = end - (end % 86_400_000);
+    match get_classic_futures_bills(credentials, start, end).await {
+        Ok(bills) => Ok(bills),
+        Err(classic_error) => get_uta_futures_bills(credentials, start, end).await
+            .map_err(|uta_error| format!("Classic bills: {classic_error}; UTA records: {uta_error}")),
+    }
 }
 
 async fn portfolio(credentials: &BitgetCredentials) -> Result<PortfolioResponse, String> {
@@ -465,23 +527,28 @@ async fn portfolio(credentials: &BitgetCredentials) -> Result<PortfolioResponse,
     }
     let assets = assets_result.unwrap_or_default();
     let futures = futures_result.map_err(|error| format!("Bitget futures positions: {error}"))?;
+    let bills_available = bills_result.is_ok();
     let bills = bills_result.unwrap_or_default();
-    let futures_balance = accounts_result.ok().and_then(summarize_futures_balance).or_else(|| uta_account_result.ok().map(summarize_uta_balance));
+    let mut futures_balance = accounts_result.ok().and_then(summarize_futures_balance).or_else(|| uta_account_result.ok().map(summarize_uta_balance));
     let ticker_map: HashMap<String, Ticker> = tickers.into_iter().map(|t| (t.symbol.clone(), t)).collect();
     let futures_ticker_map: HashMap<String, FuturesTicker> = futures_tickers.into_iter().map(|t| (canonical_futures_symbol(&t.symbol), t)).collect();
+    let pnl_bills: Vec<FuturesBill> = bills.into_iter().filter(|b| is_pnl_bill(&b.business_type)).collect();
+    let realized_total: f64 = pnl_bills.iter().map(|bill| parse_number(&bill.amount) + parse_number(&bill.fee)).sum();
     let mut realized_by_symbol: HashMap<String, f64> = HashMap::new();
-    for bill in bills.into_iter().filter(|b| is_pnl_bill(&b.business_type)) {
+    for bill in pnl_bills {
         if bill.symbol.is_empty() { continue; }
         *realized_by_symbol.entry(canonical_futures_symbol(&bill.symbol)).or_default() += parse_number(&bill.amount) + parse_number(&bill.fee);
     }
     let mut result = Vec::new();
+    let mut exchange_unrealized_total = 0.0;
+    let mut open_futures_count = 0usize;
 
     for asset in assets {
         let base = asset.coin.to_uppercase();
         let quantity = parse_number(&asset.available) + parse_number(&asset.frozen) + parse_number(&asset.locked);
         if quantity <= 0.0 { continue; }
         if base == "USDT" || base == "USDC" {
-            result.push(PortfolioCoin { symbol: format!("{base}USDT"), base, exchange: "bitget".into(), price: 1.0, change24h: 0.0, quote_volume: 0.0, high24h: 1.0, low24h: 1.0, position_value: quantity, daily_pnl: 0.0 });
+            result.push(PortfolioCoin { symbol: format!("{base}USDT"), base, exchange: "bitget".into(), price: 1.0, change24h: 0.0, quote_volume: 0.0, high24h: 1.0, low24h: 1.0, position_value: quantity, daily_pnl: 0.0, unrealized_pnl: None, realized_pnl: None, pnl_source: Some("not-applicable".into()) });
             continue;
         }
         let symbol = format!("{base}USDT");
@@ -490,9 +557,8 @@ async fn portfolio(credentials: &BitgetCredentials) -> Result<PortfolioResponse,
         let open = parse_number(&ticker.open_utc);
         let position_value = quantity * price;
         if price <= 0.0 || position_value < 0.01 { continue; }
-        let daily_pnl = if open > 0.0 { quantity * (price - open) } else { 0.0 };
         let change24h = if open > 0.0 { (price / open - 1.0) * 100.0 } else { 0.0 };
-        result.push(PortfolioCoin { symbol, base, exchange: "bitget".into(), price, change24h, quote_volume: parse_number(&ticker.quote_volume), high24h: parse_number(&ticker.high24h), low24h: parse_number(&ticker.low24h), position_value, daily_pnl });
+        result.push(PortfolioCoin { symbol, base, exchange: "bitget".into(), price, change24h, quote_volume: parse_number(&ticker.quote_volume), high24h: parse_number(&ticker.high24h), low24h: parse_number(&ticker.low24h), position_value, daily_pnl: 0.0, unrealized_pnl: None, realized_pnl: None, pnl_source: Some("not-applicable".into()) });
     }
 
     for position in futures {
@@ -509,18 +575,24 @@ async fn portfolio(credentials: &BitgetCredentials) -> Result<PortfolioResponse,
         let mark = if ticker_mark > 0.0 { ticker_mark } else { mark_price };
         if mark <= 0.0 { continue; }
         let realized_today = realized_by_symbol.remove(&symbol).unwrap_or(0.0);
-        let pnl = futures_daily_pnl(&side, total, mark, open_utc, realized_today, lifetime_pnl);
+        let realized_pnl = bills_available.then_some(realized_today);
+        let pnl = futures_net_pnl(lifetime_pnl, realized_pnl);
+        exchange_unrealized_total += lifetime_pnl;
+        open_futures_count += 1;
         result.push(PortfolioCoin {
             symbol: format!("{}-{}", symbol, side),
             base: format!("{}·{}", base, if side == "SHORT" { "S" } else { "L" }),
             exchange: "bitget".into(),
             price: mark,
-            change24h: if margin > 0.0 { pnl / margin * 100.0 } else { 0.0 },
+            change24h: if margin > 0.0 { lifetime_pnl / margin * 100.0 } else { 0.0 },
             quote_volume: 0.0,
             high24h: mark,
             low24h: open_utc,
             position_value: total * mark,
             daily_pnl: pnl,
+            unrealized_pnl: Some(lifetime_pnl),
+            realized_pnl,
+            pnl_source: Some("exchange".into()),
         });
     }
     for (symbol, pnl) in realized_by_symbol {
@@ -528,7 +600,11 @@ async fn portfolio(credentials: &BitgetCredentials) -> Result<PortfolioResponse,
         let base = symbol.trim_end_matches("USDT").to_uppercase();
         let ticker = futures_ticker_map.get(&symbol);
         let mark = ticker.map(|t| parse_number(&t.mark_price)).unwrap_or(0.0);
-        result.push(PortfolioCoin { symbol: format!("{symbol}-CLOSED"), base: format!("{base}·R"), exchange: "bitget".into(), price: mark, change24h: 0.0, quote_volume: 0.0, high24h: mark, low24h: mark, position_value: pnl.abs().max(1.0), daily_pnl: pnl });
+        result.push(PortfolioCoin { symbol: format!("{symbol}-CLOSED"), base: format!("{base}·R"), exchange: "bitget".into(), price: mark, change24h: 0.0, quote_volume: 0.0, high24h: mark, low24h: mark, position_value: pnl.abs().max(1.0), daily_pnl: pnl, unrealized_pnl: Some(0.0), realized_pnl: Some(pnl), pnl_source: Some("exchange".into()) });
+    }
+    if let Some(balance) = futures_balance.as_mut() {
+        if open_futures_count > 0 { balance.unrealized_pnl = exchange_unrealized_total; }
+        balance.realized_pnl = bills_available.then_some(realized_total);
     }
     result.sort_by(|a, b| b.position_value.total_cmp(&a.position_value));
     Ok(PortfolioResponse { positions: result, futures_balance })
@@ -540,7 +616,7 @@ async fn connect_bitget(api_key: String, api_secret: String, passphrase: String,
     let credentials = BitgetCredentials { api_key, api_secret, passphrase };
     let result = portfolio(&credentials).await?;
     if save_login { encrypt_credentials(&app, &credentials, login_password.as_deref().unwrap_or_default())?; }
-    save_snapshot(&app, &result.positions)?;
+    save_snapshot(&app, &result.positions, result.futures_balance.as_ref())?;
     *state.0.lock().map_err(|_| "Credential state error".to_string())? = Some(credentials);
     Ok(result)
 }
@@ -549,7 +625,7 @@ async fn connect_bitget(api_key: String, api_secret: String, passphrase: String,
 async fn login_bitget(login_password: String, state: tauri::State<'_, BitgetState>, app: tauri::AppHandle) -> Result<PortfolioResponse, String> {
     let credentials = decrypt_credentials(&app, &login_password)?;
     let result = portfolio(&credentials).await?;
-    save_snapshot(&app, &result.positions)?;
+    save_snapshot(&app, &result.positions, result.futures_balance.as_ref())?;
     *state.0.lock().map_err(|_| "Credential state error".to_string())? = Some(credentials);
     Ok(result)
 }
@@ -568,7 +644,7 @@ fn delete_saved_login(app: tauri::AppHandle) -> Result<(), String> {
 async fn refresh_bitget(state: tauri::State<'_, BitgetState>, app: tauri::AppHandle) -> Result<PortfolioResponse, String> {
     let credentials = state.0.lock().map_err(|_| "Credential state error".to_string())?.clone().ok_or("Bitget is not connected")?;
     let result = portfolio(&credentials).await?;
-    save_snapshot(&app, &result.positions)?;
+    save_snapshot(&app, &result.positions, result.futures_balance.as_ref())?;
     Ok(result)
 }
 
@@ -600,7 +676,7 @@ mod tests {
     use super::*;
 
     fn coin(pnl: f64, value: f64) -> PortfolioCoin {
-        PortfolioCoin { symbol: "BTCUSDT".into(), base: "BTC".into(), exchange: "bitget".into(), price: 100.0, change24h: 1.0, quote_volume: 10.0, high24h: 105.0, low24h: 95.0, position_value: value, daily_pnl: pnl }
+        PortfolioCoin { symbol: "BTCUSDT".into(), base: "BTC".into(), exchange: "bitget".into(), price: 100.0, change24h: 1.0, quote_volume: 10.0, high24h: 105.0, low24h: 95.0, position_value: value, daily_pnl: pnl, unrealized_pnl: Some(pnl), realized_pnl: Some(0.0), pnl_source: Some("exchange".into()) }
     }
 
     #[test]
@@ -624,22 +700,34 @@ mod tests {
     #[test]
     fn history_coalesces_five_minute_bucket_and_sums_values() {
         let mut history = Vec::new();
-        merge_snapshot(&mut history, &[coin(5.0, 100.0), coin(-2.0, 40.0)], 600_001);
+        merge_snapshot(&mut history, &[coin(5.0, 100.0), coin(-2.0, 40.0)], None, 600_001);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].total_pnl, 3.0);
+        assert_eq!(history[0].unrealized_pnl, 3.0);
+        assert_eq!(history[0].realized_pnl, Some(0.0));
         assert_eq!(history[0].portfolio_value, 140.0);
-        merge_snapshot(&mut history, &[coin(8.0, 120.0)], 600_999);
+        merge_snapshot(&mut history, &[coin(8.0, 120.0)], None, 600_999);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].total_pnl, 8.0);
-        merge_snapshot(&mut history, &[coin(9.0, 130.0)], 900_001);
+        merge_snapshot(&mut history, &[coin(9.0, 130.0)], None, 900_001);
         assert_eq!(history.len(), 2);
     }
 
     #[test]
-    fn futures_daily_profit_respects_long_short_and_realized() {
-        assert_eq!(futures_daily_pnl("LONG", 2.0, 110.0, 100.0, 3.0, 0.0), 23.0);
-        assert_eq!(futures_daily_pnl("SHORT", 2.0, 90.0, 100.0, -1.0, 0.0), 19.0);
-        assert_eq!(futures_daily_pnl("LONG", 2.0, 110.0, 0.0, 3.0, 7.0), 10.0);
+    fn history_uses_exchange_account_totals_when_available() {
+        let mut history = Vec::new();
+        let balance = FuturesBalanceSummary { margin_coin: "USDT".into(), available: 100.0, locked: 0.0, account_equity: 114.0, unrealized_pnl: 10.0, realized_pnl: Some(4.0), max_transfer_out: 100.0 };
+        merge_snapshot(&mut history, &[coin(3.0, 100.0)], Some(&balance), 600_001);
+        assert_eq!(history[0].unrealized_pnl, 10.0);
+        assert_eq!(history[0].realized_pnl, Some(4.0));
+        assert_eq!(history[0].total_pnl, 14.0);
+    }
+
+    #[test]
+    fn futures_net_profit_uses_exchange_unrealized_not_utc_open_price() {
+        assert_eq!(futures_net_pnl(-7.25, Some(0.0)), -7.25);
+        assert_eq!(futures_net_pnl(-7.25, Some(1.5)), -5.75);
+        assert_eq!(futures_net_pnl(-7.25, None), -7.25);
     }
 
     #[test]
@@ -647,6 +735,8 @@ mod tests {
         assert!(is_pnl_bill("close_long"));
         assert!(is_pnl_bill("contract_settle_fee"));
         assert!(!is_pnl_bill("trans_from_exchange"));
+        assert!(!is_pnl_bill("TRANSFER_IN"));
+        assert!(!is_pnl_bill("USER_EXCHANGE_BUY"));
         assert!(!is_pnl_bill("append_margin"));
         assert!(!is_pnl_bill("bonus_issue"));
     }
@@ -659,12 +749,24 @@ mod tests {
             locked: "20.50".into(),
             account_equity: "130.75".into(),
             unrealized_pl: "5.00".into(),
+            crossed_unrealized_pl: "4.00".into(),
+            isolated_unrealized_pl: "3.00".into(),
             max_transfer_out: "90.00".into(),
         }]).unwrap();
         assert_eq!(summary.available, 105.25);
         assert_eq!(summary.locked, 20.5);
         assert_eq!(summary.account_equity, 130.75);
         assert_eq!(summary.unrealized_pnl, 5.0);
+        assert_eq!(summary.realized_pnl, None);
+    }
+
+    #[test]
+    fn futures_balance_falls_back_to_crossed_plus_isolated_unrealized() {
+        let summary = summarize_futures_balance(vec![FuturesAccount {
+            margin_coin: "USDT".into(), available: "100".into(), locked: "0".into(), account_equity: "90".into(),
+            unrealized_pl: "".into(), crossed_unrealized_pl: "-3.25".into(), isolated_unrealized_pl: "-2.75".into(), max_transfer_out: "80".into(),
+        }]).unwrap();
+        assert_eq!(summary.unrealized_pnl, -6.0);
     }
 
     #[test]
@@ -678,16 +780,18 @@ mod tests {
 
     #[test]
     fn classic_position_parser_accepts_documented_and_wrapped_data() {
-        let documented = r#"{"code":"00000","msg":"success","data":[{"symbol":"XMRUSDT","holdSide":"long","marginSize":"100","total":"2.67","unrealizedPL":"-10.89","markPrice":"361.69"}]}"#;
+        let documented = r#"{"code":"00000","msg":"success","data":[{"symbol":"BTCUSDT","holdSide":"long","marginSize":"80","total":"0.01","unrealizedPL":"-7.25","markPrice":"64000"},{"symbol":"SOLUSDT","holdSide":"short","marginSize":"50","total":"1.5","unrealizedPL":"2.25","markPrice":"75"}]}"#;
         let positions = parse_bitget_data::<ClassicPositionData>(documented, "Classic").unwrap().into_positions();
-        assert_eq!(positions.len(), 1);
-        assert_eq!(positions[0].symbol, "XMRUSDT");
-        assert_eq!(positions[0].total, "2.67");
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions[0].symbol, "BTCUSDT");
+        assert_eq!(positions[0].total, "0.01");
+        assert_eq!(positions[1].symbol, "SOLUSDT");
 
-        let wrapped = r#"{"code":"00000","msg":"success","data":{"list":[{"symbol":"XMRUSDT","holdSide":"long","marginSize":100,"total":2.67,"unrealizedPL":null}]}}"#;
+        let wrapped = r#"{"code":"00000","msg":"success","data":{"list":[{"symbol":"ETHUSDT","holdSide":"short","marginSize":60,"total":0.2,"unrealizedPL":null}]}}"#;
         let positions = parse_bitget_data::<ClassicPositionData>(wrapped, "Classic").unwrap().into_positions();
-        assert_eq!(positions[0].margin_size, "100");
-        assert_eq!(positions[0].total, "2.67");
+        assert_eq!(positions[0].symbol, "ETHUSDT");
+        assert_eq!(positions[0].margin_size, "60");
+        assert_eq!(positions[0].total, "0.2");
         assert!(positions[0].unrealized_pl.is_empty());
         assert!(positions[0].mark_price.is_empty());
     }
@@ -699,8 +803,8 @@ mod tests {
     }
 
     #[test]
-    fn tradingview_perpetual_symbol_matches_bitget_rest_symbol() {
-        assert_eq!(canonical_futures_symbol("XMRUSDTPERP"), "XMRUSDT");
-        assert_eq!(canonical_futures_symbol("xmrusdt"), "XMRUSDT");
+    fn symbol_normalization_handles_multiple_contracts_case_and_whitespace() {
+        let cases = [("BTCUSDTPERP", "BTCUSDT"), ("ethusdtperp", "ETHUSDT"), ("  SOLUSDT  ", "SOLUSDT"), ("1000PEPEUSDTPERP", "1000PEPEUSDT"), ("PERPUSDT", "PERPUSDT")];
+        for (input, expected) in cases { assert_eq!(canonical_futures_symbol(input), expected); }
     }
 }

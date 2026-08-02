@@ -1,4 +1,5 @@
 export type Exchange = 'binance' | 'bitget';
+export type PnlSource = 'exchange' | 'market-change' | 'not-applicable';
 
 export interface MarketCoin {
   symbol: string;
@@ -11,6 +12,9 @@ export interface MarketCoin {
   low24h?: number;
   positionValue: number;
   dailyPnl: number;
+  unrealizedPnl?: number;
+  realizedPnl?: number;
+  pnlSource?: PnlSource;
 }
 
 export interface FuturesBalance {
@@ -19,6 +23,7 @@ export interface FuturesBalance {
   locked: number;
   accountEquity: number;
   unrealizedPnl: number;
+  realizedPnl?: number | null;
   maxTransferOut: number;
 }
 
@@ -30,6 +35,8 @@ export interface PortfolioResponse {
 export interface ProfitHistoryEntry {
   timestamp: number;
   totalPnl: number;
+  unrealizedPnl?: number;
+  realizedPnl?: number | null;
   portfolioValue: number;
   positions: MarketCoin[];
 }
