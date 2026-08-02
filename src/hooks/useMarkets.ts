@@ -1,0 +1,31 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { fetchMarkets } from '../services/exchanges';
+import type { Exchange, MarketCoin } from '../types';
+
+export function useMarkets(exchange: Exchange) {
+  const [data, setData] = useState<MarketCoin[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [live, setLive] = useState(false);
+  const [updatedAt, setUpdatedAt] = useState<Date>();
+  const controller = useRef<AbortController | undefined>(undefined);
+
+  const refresh = useCallback(async () => {
+    controller.current?.abort();
+    controller.current = new AbortController();
+    setLoading(true);
+    try {
+      const result = await fetchMarkets(exchange, controller.current.signal);
+      setData(result.data); setLive(result.live); setUpdatedAt(new Date());
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === 'AbortError')) throw error;
+    } finally { setLoading(false); }
+  }, [exchange]);
+
+  useEffect(() => {
+    refresh();
+    const timer = window.setInterval(refresh, 30_000);
+    return () => { window.clearInterval(timer); controller.current?.abort(); };
+  }, [refresh]);
+
+  return { data, loading, live, updatedAt, refresh };
+}

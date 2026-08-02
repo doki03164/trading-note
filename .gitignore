@@ -1,0 +1,14 @@
+node_modules/
+dist/
+src-tauri/target/
+.DS_Store
+*.log
+android/.gradle/
+android/app/build/
+ios/App/Pods/
+outputs/
+work/
+*.tsbuildinfo
+.idea/
+.vscode/
+android/local.properties

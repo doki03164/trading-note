@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Trading Journal",
+  "version": "0.1.0",
+  "identifier": "com.pulsegrid.desktop",
+  "build": {
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Trading Journal — Daily Profit Heatmap",
+        "width": 1440,
+        "height": 960,
+        "minWidth": 900,
+        "minHeight": 650,
+        "decorations": true,
+        "resizable": true,
+        "backgroundColor": "#07080a"
+      }
+    ],
+    "security": { "csp": null }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "category": "Finance",
+    "shortDescription": "Daily crypto portfolio profit heatmap"
+  }
+}
