@@ -890,7 +890,7 @@ mod tests {
         assert_eq!(contract.mark_price, Some(1995.0));
         assert_eq!(contract.unrealized_pnl, Some(3.5));
         assert_eq!(contract.daily_pnl, 4.5);
-        assert_eq!(contract.roi, Some(7.0));
+        assert!((contract.roi.unwrap_or_default() - 7.0).abs() < 1e-9);
         assert_eq!(contract.position_updated_at, Some(1_760_000_000_000));
     }
 
