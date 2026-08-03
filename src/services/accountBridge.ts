@@ -6,8 +6,34 @@ interface Credentials { apiKey: string; apiSecret: string; passphrase: string }
 interface ApiEnvelope<T> { code: string | number; msg?: string; message?: string; data?: T | null }
 interface SpotAsset { coin: string; available: string; frozen: string; locked: string }
 interface SpotTicker { symbol: string; lastPr: string; openUtc: string; quoteVolume: string; high24h: string; low24h: string }
-interface FuturesPosition { symbol: string; holdSide: string; marginSize: string; total: string; unrealizedPL: string; markPrice: string }
-interface UtaFuturesPosition { symbol: string; posSide: string; positionBalance: string; total: string; unrealisedPnl: string; markPrice: string }
+interface FuturesPosition {
+  symbol: string;
+  holdSide: string;
+  marginSize: string;
+  total: string;
+  unrealizedPL: string;
+  markPrice: string;
+  openPriceAvg?: string;
+  leverage?: string;
+  liquidationPrice?: string;
+  marginMode?: string;
+  profitRate?: string;
+  uTime?: string;
+}
+interface UtaFuturesPosition {
+  symbol: string;
+  posSide: string;
+  positionBalance: string;
+  total: string;
+  unrealisedPnl: string;
+  markPrice: string;
+  avgPrice?: string;
+  leverage?: string;
+  liquidationPrice?: string;
+  marginMode?: string;
+  profitRate?: string;
+  updatedTime?: string;
+}
 interface UtaPositionData { list: UtaFuturesPosition[] }
 interface UtaAsset { coin: string; balance: string; available: string; locked: string }
 interface UtaAccountData { accountEquity: string; usdtEquity: string; unrealisedPnl: string; usdtUnrealisedPnl: string; assets: UtaAsset[] }
@@ -76,7 +102,70 @@ export function futuresAccountUnrealized(account: FuturesAccount) {
 export function actualFuturesPnl(unrealizedPnl: number, realizedPnl?: number | null) { return unrealizedPnl + (realizedPnl ?? 0); }
 
 export function normalizeUtaPosition(position: UtaFuturesPosition): FuturesPosition {
-  return { symbol: position.symbol, holdSide: position.posSide, marginSize: position.positionBalance, total: position.total, unrealizedPL: position.unrealisedPnl, markPrice: position.markPrice };
+  return {
+    symbol: position.symbol,
+    holdSide: position.posSide,
+    marginSize: position.positionBalance,
+    total: position.total,
+    unrealizedPL: position.unrealisedPnl,
+    markPrice: position.markPrice,
+    openPriceAvg: position.avgPrice,
+    leverage: position.leverage,
+    liquidationPrice: position.liquidationPrice,
+    marginMode: position.marginMode,
+    profitRate: position.profitRate,
+    uTime: position.updatedTime,
+  };
+}
+
+export function futuresPositionToMarketCoin(position: FuturesPosition, realizedPnl?: number, fallbackMark = 0): MarketCoin | null {
+  const quantity = number(position.total), margin = number(position.marginSize);
+  const markPrice = number(position.markPrice) || fallbackMark;
+  if (quantity <= 0 || markPrice <= 0) return null;
+  const symbol = canonicalFuturesSymbol(position.symbol);
+  const side = position.holdSide.trim().toUpperCase() === 'SHORT' ? 'SHORT' : 'LONG';
+  const unrealizedPnl = number(position.unrealizedPL);
+  const suppliedRoi = number(position.profitRate) * 100;
+  const roi = position.profitRate?.trim() ? suppliedRoi : margin > 0 ? unrealizedPnl / margin * 100 : 0;
+  const base = symbol.replace(/USDT$/, '').toUpperCase();
+  const liquidation = number(position.liquidationPrice);
+  const updatedAt = number(position.uTime);
+  return {
+    symbol: `${symbol}-${side}`,
+    base: `${base}·${side === 'SHORT' ? 'S' : 'L'}`,
+    exchange: 'bitget',
+    price: markPrice,
+    change24h: roi,
+    quoteVolume: 0,
+    high24h: markPrice,
+    low24h: number(position.openPriceAvg),
+    positionValue: quantity * markPrice,
+    dailyPnl: actualFuturesPnl(unrealizedPnl, realizedPnl),
+    unrealizedPnl,
+    realizedPnl,
+    pnlSource: 'exchange',
+    side,
+    quantity,
+    margin,
+    entryPrice: number(position.openPriceAvg),
+    markPrice,
+    leverage: number(position.leverage),
+    liquidationPrice: liquidation > 0 ? liquidation : null,
+    marginMode: position.marginMode?.toUpperCase() || undefined,
+    roi,
+    positionUpdatedAt: updatedAt > 0 ? updatedAt : null,
+  };
+}
+
+export function mergeLiveContracts(previous: MarketCoin[], liveContracts: MarketCoin[]) {
+  const priorContracts = new Map(previous.filter(item => item.side).map(item => [item.symbol, item]));
+  const retained = previous.filter(item => !item.side);
+  const merged = liveContracts.map(item => {
+    const prior = priorContracts.get(item.symbol);
+    const realizedPnl = prior?.realizedPnl;
+    return { ...item, realizedPnl, dailyPnl: actualFuturesPnl(item.unrealizedPnl ?? 0, realizedPnl) };
+  });
+  return [...retained, ...merged].sort((a, b) => b.positionValue - a.positionValue);
 }
 
 export function classicPositionList(data: FuturesPosition[] | { list?: FuturesPosition[] }) {
@@ -175,29 +264,24 @@ async function mobilePortfolio(credentials: Credentials): Promise<PortfolioRespo
     const quantity = number(asset.available) + number(asset.frozen) + number(asset.locked);
     if (quantity <= 0) continue;
     if (base === 'USDT' || base === 'USDC') {
-      positions.push({ symbol: `${base}USDT`, base, exchange: 'bitget', price: 1, change24h: 0, quoteVolume: 0, high24h: 1, low24h: 1, positionValue: quantity, dailyPnl: 0, pnlSource: 'not-applicable' });
+      positions.push({ symbol: `${base}USDT`, base, exchange: 'bitget', price: 1, change24h: 0, quoteVolume: 0, high24h: 1, low24h: 1, positionValue: quantity, dailyPnl: 0, pnlSource: 'not-applicable', quantity });
       continue;
     }
     const ticker = tickerMap.get(`${base}USDT`);
     if (!ticker) continue;
     const price = number(ticker.lastPr), open = number(ticker.openUtc), value = quantity * price;
     if (price <= 0 || value < .01) continue;
-    positions.push({ symbol: `${base}USDT`, base, exchange: 'bitget', price, change24h: open > 0 ? (price / open - 1) * 100 : 0, quoteVolume: number(ticker.quoteVolume), high24h: number(ticker.high24h), low24h: number(ticker.low24h), positionValue: value, dailyPnl: 0, pnlSource: 'not-applicable' });
+    positions.push({ symbol: `${base}USDT`, base, exchange: 'bitget', price, change24h: open > 0 ? (price / open - 1) * 100 : 0, quoteVolume: number(ticker.quoteVolume), high24h: number(ticker.high24h), low24h: number(ticker.low24h), positionValue: value, dailyPnl: 0, pnlSource: 'not-applicable', quantity });
   }
   for (const position of futuresResult) {
-    const total = number(position.total), margin = number(position.marginSize);
     const symbol = canonicalFuturesSymbol(position.symbol);
     const ticker = futuresTickerMap.get(symbol);
-    const mark = number(ticker?.markPrice) || number(position.markPrice), open = number(ticker?.openUtc);
-    if (total <= 0 || mark <= 0) continue;
-    const side = position.holdSide.toUpperCase();
-    const unrealizedPnl = number(position.unrealizedPL);
     const realizedToday = realized.get(symbol) ?? 0;
-    realized.delete(symbol);
     const realizedPnl = billsResult.available ? realizedToday : undefined;
-    const pnl = actualFuturesPnl(unrealizedPnl, realizedPnl);
-    const base = symbol.replace(/USDT$/, '').toUpperCase();
-    positions.push({ symbol: `${symbol}-${side}`, base: `${base}·${side === 'SHORT' ? 'S' : 'L'}`, exchange: 'bitget', price: mark, change24h: margin > 0 ? unrealizedPnl / margin * 100 : 0, quoteVolume: 0, high24h: mark, low24h: open, positionValue: total * mark, dailyPnl: pnl, unrealizedPnl, realizedPnl, pnlSource: 'exchange' });
+    const item = futuresPositionToMarketCoin(position, realizedPnl, number(ticker?.markPrice));
+    if (!item) continue;
+    realized.delete(symbol);
+    positions.push(item);
   }
   for (const [symbol, pnl] of realized) {
     if (Math.abs(pnl) < .000001) continue;
@@ -266,6 +350,12 @@ export async function refreshBitgetAccount() {
   if (isTauriDesktop()) return invoke<PortfolioResponse>('refresh_bitget');
   if (!mobileCredentials) throw new Error('Bitget is not connected');
   const snapshot = await mobilePortfolio(mobileCredentials); saveMobileSnapshot(snapshot); return snapshot;
+}
+export async function refreshBitgetContracts() {
+  if (isTauriDesktop()) return invoke<MarketCoin[]>('refresh_bitget_contracts');
+  if (!mobileCredentials) throw new Error('Bitget is not connected');
+  const positions = await mobileFuturesPositions(mobileCredentials);
+  return positions.map(position => futuresPositionToMarketCoin(position)).filter((item): item is MarketCoin => item != null);
 }
 export async function disconnectBitgetAccount() { if (isTauriDesktop()) await invoke('disconnect_bitget'); mobileCredentials = undefined; }
 export async function hasSavedBitgetLogin() { return isTauriDesktop() ? invoke<boolean>('has_saved_login') : Boolean(localStorage.getItem(VAULT_KEY)); }

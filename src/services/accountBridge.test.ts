@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { actualFuturesPnl, bitgetSignature, canonicalFuturesSymbol, classicPositionList, futuresAccountUnrealized, normalizeUtaPosition, parseBitgetResponse } from './accountBridge';
+import { actualFuturesPnl, bitgetSignature, canonicalFuturesSymbol, classicPositionList, futuresAccountUnrealized, futuresPositionToMarketCoin, mergeLiveContracts, normalizeUtaPosition, parseBitgetResponse } from './accountBridge';
+import type { MarketCoin } from '../types';
 
 describe('cross-platform Bitget account bridge', () => {
   it('matches the backend HMAC signature vector', async () => {
@@ -8,7 +9,7 @@ describe('cross-platform Bitget account bridge', () => {
   });
 
   it('normalizes Unified Trading Account positions for the shared portfolio view', () => {
-    expect(normalizeUtaPosition({ symbol: 'BTCUSDT', posSide: 'short', positionBalance: '120', total: '0.01', unrealisedPnl: '4.5', markPrice: '90000' })).toEqual({ symbol: 'BTCUSDT', holdSide: 'short', marginSize: '120', total: '0.01', unrealizedPL: '4.5', markPrice: '90000' });
+    expect(normalizeUtaPosition({ symbol: 'BTCUSDT', posSide: 'short', positionBalance: '120', total: '0.01', unrealisedPnl: '4.5', markPrice: '90000', avgPrice: '89500', leverage: '6', liquidationPrice: '101000', marginMode: 'isolated', profitRate: '0.0375', updatedTime: '1760000000000' })).toMatchObject({ symbol: 'BTCUSDT', holdSide: 'short', marginSize: '120', total: '0.01', unrealizedPL: '4.5', markPrice: '90000', openPriceAvg: '89500', leverage: '6', liquidationPrice: '101000', marginMode: 'isolated', profitRate: '0.0375', uTime: '1760000000000' });
   });
 
   it('normalizes multiple perpetual symbols without depending on a held contract', () => {
@@ -42,5 +43,26 @@ describe('cross-platform Bitget account bridge', () => {
   it('includes isolated unrealized P&L when the aggregate account field is empty', () => {
     expect(futuresAccountUnrealized({ marginCoin: 'USDT', unrealizedPL: '', crossedUnrealizedPL: '-3.25', isolatedUnrealizedPL: '-2.75' })).toBe(-6);
     expect(futuresAccountUnrealized({ marginCoin: 'USDT', unrealizedPL: '-4.5', crossedUnrealizedPL: '-3.25', isolatedUnrealizedPL: '-2.75' })).toBe(-4.5);
+  });
+
+  it('maps every live contract field from the exchange position response', () => {
+    const contract = futuresPositionToMarketCoin({
+      symbol: 'BTCUSDT', holdSide: 'long', marginSize: '80', total: '0.01', unrealizedPL: '-7.25',
+      markPrice: '64000', openPriceAvg: '64725', leverage: '8', liquidationPrice: '58000', marginMode: 'isolated', uTime: '1760000000000',
+    });
+    expect(contract).toMatchObject({
+      symbol: 'BTCUSDT-LONG', side: 'LONG', quantity: 0.01, margin: 80, entryPrice: 64725,
+      markPrice: 64000, leverage: 8, liquidationPrice: 58000, marginMode: 'ISOLATED',
+      unrealizedPnl: -7.25, dailyPnl: -7.25, roi: -9.0625, positionUpdatedAt: 1760000000000,
+    });
+  });
+
+  it('merges two-second contract updates without inventing or losing confirmed realized P&L', () => {
+    const priorContract = futuresPositionToMarketCoin({ symbol: 'ETHUSDT', holdSide: 'short', marginSize: '50', total: '0.2', unrealizedPL: '2', markPrice: '2000' }, 1)!;
+    const liveContract = futuresPositionToMarketCoin({ symbol: 'ETHUSDT', holdSide: 'short', marginSize: '50', total: '0.2', unrealizedPL: '3', markPrice: '1995' })!;
+    const spot: MarketCoin = { symbol: 'BTCUSDT', base: 'BTC', exchange: 'bitget', price: 64000, change24h: 1, quoteVolume: 0, positionValue: 100, dailyPnl: 0 };
+    const merged = mergeLiveContracts([priorContract, spot], [liveContract]);
+    expect(merged.find(item => item.symbol === 'ETHUSDT-SHORT')).toMatchObject({ unrealizedPnl: 3, realizedPnl: 1, dailyPnl: 4, price: 1995 });
+    expect(merged.find(item => item.symbol === 'BTCUSDT')).toBe(spot);
   });
 });

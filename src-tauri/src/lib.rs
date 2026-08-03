@@ -47,6 +47,12 @@ struct FuturesPosition {
     #[serde(default, deserialize_with = "string_or_default")] total: String,
     #[serde(default, deserialize_with = "string_or_default")] unrealized_pl: String,
     #[serde(default, deserialize_with = "string_or_default")] mark_price: String,
+    #[serde(default, deserialize_with = "string_or_default")] open_price_avg: String,
+    #[serde(default, deserialize_with = "string_or_default")] leverage: String,
+    #[serde(default, deserialize_with = "string_or_default")] liquidation_price: String,
+    #[serde(default, deserialize_with = "string_or_default")] margin_mode: String,
+    #[serde(default, deserialize_with = "string_or_default")] profit_rate: String,
+    #[serde(default, deserialize_with = "string_or_default")] u_time: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,10 +65,33 @@ impl ClassicPositionData {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct UtaFuturesPosition { symbol: String, pos_side: String, position_balance: String, total: String, unrealised_pnl: String, mark_price: String }
+struct UtaFuturesPosition {
+    symbol: String,
+    pos_side: String,
+    position_balance: String,
+    total: String,
+    unrealised_pnl: String,
+    mark_price: String,
+    #[serde(default)] avg_price: String,
+    #[serde(default)] leverage: String,
+    #[serde(default)] liquidation_price: String,
+    #[serde(default)] margin_mode: String,
+    #[serde(default)] profit_rate: String,
+    #[serde(default)] updated_time: String,
+}
 
 #[derive(Deserialize)]
 struct UtaPositionData { list: Vec<UtaFuturesPosition> }
+
+fn normalize_uta_position(position: UtaFuturesPosition) -> FuturesPosition {
+    FuturesPosition {
+        symbol: position.symbol, hold_side: position.pos_side, margin_size: position.position_balance,
+        total: position.total, unrealized_pl: position.unrealised_pnl, mark_price: position.mark_price,
+        open_price_avg: position.avg_price, leverage: position.leverage,
+        liquidation_price: position.liquidation_price, margin_mode: position.margin_mode,
+        profit_rate: position.profit_rate, u_time: position.updated_time,
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,7 +103,7 @@ struct UtaAccountData { #[serde(default)] account_equity: String, #[serde(defaul
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct FuturesTicker { symbol: String, open_utc: String, mark_price: String }
+struct FuturesTicker { symbol: String, mark_price: String }
 
 #[derive(Deserialize)]
 struct FuturesBillData { bills: Vec<FuturesBill>, #[serde(default)] end_id: String }
@@ -111,7 +140,7 @@ struct FuturesAccount {
 #[serde(rename_all = "camelCase")]
 struct Ticker { symbol: String, last_pr: String, open_utc: String, quote_volume: String, high24h: String, low24h: String }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct PortfolioCoin {
     symbol: String,
@@ -127,6 +156,16 @@ struct PortfolioCoin {
     #[serde(default)] unrealized_pnl: Option<f64>,
     #[serde(default)] realized_pnl: Option<f64>,
     #[serde(default)] pnl_source: Option<String>,
+    #[serde(default)] side: Option<String>,
+    #[serde(default)] quantity: Option<f64>,
+    #[serde(default)] margin: Option<f64>,
+    #[serde(default)] entry_price: Option<f64>,
+    #[serde(default)] mark_price: Option<f64>,
+    #[serde(default)] leverage: Option<f64>,
+    #[serde(default)] liquidation_price: Option<f64>,
+    #[serde(default)] margin_mode: Option<String>,
+    #[serde(default)] roi: Option<f64>,
+    #[serde(default)] position_updated_at: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -371,10 +410,7 @@ async fn get_uta_futures(credentials: &BitgetCredentials) -> Result<Vec<FuturesP
     let body = response.text().await.map_err(|e| e.to_string())?;
     if !status.is_success() { return Err(bitget_http_error("Bitget UTA futures", status, &body)); }
     let data = parse_bitget_data::<UtaPositionData>(&body, "Bitget UTA futures")?;
-    Ok(data.list.into_iter().map(|position| FuturesPosition {
-        symbol: position.symbol, hold_side: position.pos_side, margin_size: position.position_balance,
-        total: position.total, unrealized_pl: position.unrealised_pnl, mark_price: position.mark_price,
-    }).collect())
+    Ok(data.list.into_iter().map(normalize_uta_position).collect())
 }
 
 async fn get_all_futures(credentials: &BitgetCredentials) -> Result<Vec<FuturesPosition>, String> {
@@ -454,6 +490,50 @@ fn is_pnl_bill(business_type: &str) -> bool {
 }
 
 fn futures_net_pnl(unrealized_pnl: f64, realized_pnl: Option<f64>) -> f64 { unrealized_pnl + realized_pnl.unwrap_or(0.0) }
+
+fn futures_position_coin(position: &FuturesPosition, realized_pnl: Option<f64>, fallback_mark: f64) -> Option<PortfolioCoin> {
+    let quantity = parse_number(&position.total);
+    let position_mark = parse_number(&position.mark_price);
+    let mark = if position_mark > 0.0 { position_mark } else { fallback_mark };
+    if quantity <= 0.0 || mark <= 0.0 { return None; }
+    let unrealized_pnl = parse_number(&position.unrealized_pl);
+    let margin = parse_number(&position.margin_size);
+    let side = if position.hold_side.eq_ignore_ascii_case("short") { "SHORT" } else { "LONG" };
+    let symbol = canonical_futures_symbol(&position.symbol);
+    let base = symbol.trim_end_matches("USDT").to_uppercase();
+    let roi = if position.profit_rate.trim().is_empty() {
+        if margin > 0.0 { unrealized_pnl / margin * 100.0 } else { 0.0 }
+    } else {
+        parse_number(&position.profit_rate) * 100.0
+    };
+    let liquidation_price = parse_number(&position.liquidation_price);
+    let updated_at = parse_number(&position.u_time);
+    Some(PortfolioCoin {
+        symbol: format!("{symbol}-{side}"),
+        base: format!("{}·{}", base, if side == "SHORT" { "S" } else { "L" }),
+        exchange: "bitget".into(),
+        price: mark,
+        change24h: roi,
+        quote_volume: 0.0,
+        high24h: mark,
+        low24h: parse_number(&position.open_price_avg),
+        position_value: quantity * mark,
+        daily_pnl: futures_net_pnl(unrealized_pnl, realized_pnl),
+        unrealized_pnl: Some(unrealized_pnl),
+        realized_pnl,
+        pnl_source: Some("exchange".into()),
+        side: Some(side.into()),
+        quantity: Some(quantity),
+        margin: Some(margin),
+        entry_price: Some(parse_number(&position.open_price_avg)),
+        mark_price: Some(mark),
+        leverage: Some(parse_number(&position.leverage)),
+        liquidation_price: (liquidation_price > 0.0).then_some(liquidation_price),
+        margin_mode: (!position.margin_mode.is_empty()).then(|| position.margin_mode.to_uppercase()),
+        roi: Some(roi),
+        position_updated_at: (updated_at > 0.0).then_some(updated_at as u64),
+    })
+}
 
 async fn get_signed_data<T: DeserializeOwned>(credentials: &BitgetCredentials, path: &str, query: &str, context: &str) -> Result<T, String> {
     let timestamp = timestamp_ms();
@@ -548,7 +628,7 @@ async fn portfolio(credentials: &BitgetCredentials) -> Result<PortfolioResponse,
         let quantity = parse_number(&asset.available) + parse_number(&asset.frozen) + parse_number(&asset.locked);
         if quantity <= 0.0 { continue; }
         if base == "USDT" || base == "USDC" {
-            result.push(PortfolioCoin { symbol: format!("{base}USDT"), base, exchange: "bitget".into(), price: 1.0, change24h: 0.0, quote_volume: 0.0, high24h: 1.0, low24h: 1.0, position_value: quantity, daily_pnl: 0.0, unrealized_pnl: None, realized_pnl: None, pnl_source: Some("not-applicable".into()) });
+            result.push(PortfolioCoin { symbol: format!("{base}USDT"), base, exchange: "bitget".into(), price: 1.0, change24h: 0.0, quote_volume: 0.0, high24h: 1.0, low24h: 1.0, position_value: quantity, daily_pnl: 0.0, unrealized_pnl: None, realized_pnl: None, pnl_source: Some("not-applicable".into()), quantity: Some(quantity), ..PortfolioCoin::default() });
             continue;
         }
         let symbol = format!("{base}USDT");
@@ -558,49 +638,27 @@ async fn portfolio(credentials: &BitgetCredentials) -> Result<PortfolioResponse,
         let position_value = quantity * price;
         if price <= 0.0 || position_value < 0.01 { continue; }
         let change24h = if open > 0.0 { (price / open - 1.0) * 100.0 } else { 0.0 };
-        result.push(PortfolioCoin { symbol, base, exchange: "bitget".into(), price, change24h, quote_volume: parse_number(&ticker.quote_volume), high24h: parse_number(&ticker.high24h), low24h: parse_number(&ticker.low24h), position_value, daily_pnl: 0.0, unrealized_pnl: None, realized_pnl: None, pnl_source: Some("not-applicable".into()) });
+        result.push(PortfolioCoin { symbol, base, exchange: "bitget".into(), price, change24h, quote_volume: parse_number(&ticker.quote_volume), high24h: parse_number(&ticker.high24h), low24h: parse_number(&ticker.low24h), position_value, daily_pnl: 0.0, unrealized_pnl: None, realized_pnl: None, pnl_source: Some("not-applicable".into()), quantity: Some(quantity), ..PortfolioCoin::default() });
     }
 
     for position in futures {
-        let total = parse_number(&position.total);
-        let mark_price = parse_number(&position.mark_price);
-        if total <= 0.0 { continue; }
         let lifetime_pnl = parse_number(&position.unrealized_pl);
-        let margin = parse_number(&position.margin_size);
-        let side = position.hold_side.to_uppercase();
         let symbol = canonical_futures_symbol(&position.symbol);
-        let base = symbol.trim_end_matches("USDT").to_uppercase();
-        let open_utc = futures_ticker_map.get(&symbol).map(|t| parse_number(&t.open_utc)).unwrap_or(0.0);
-        let ticker_mark = futures_ticker_map.get(&symbol).map(|t| parse_number(&t.mark_price)).unwrap_or(mark_price);
-        let mark = if ticker_mark > 0.0 { ticker_mark } else { mark_price };
-        if mark <= 0.0 { continue; }
-        let realized_today = realized_by_symbol.remove(&symbol).unwrap_or(0.0);
+        let realized_today = realized_by_symbol.get(&symbol).copied().unwrap_or(0.0);
         let realized_pnl = bills_available.then_some(realized_today);
-        let pnl = futures_net_pnl(lifetime_pnl, realized_pnl);
+        let fallback_mark = futures_ticker_map.get(&symbol).map(|t| parse_number(&t.mark_price)).unwrap_or(0.0);
+        let Some(coin) = futures_position_coin(&position, realized_pnl, fallback_mark) else { continue };
+        realized_by_symbol.remove(&symbol);
         exchange_unrealized_total += lifetime_pnl;
         open_futures_count += 1;
-        result.push(PortfolioCoin {
-            symbol: format!("{}-{}", symbol, side),
-            base: format!("{}·{}", base, if side == "SHORT" { "S" } else { "L" }),
-            exchange: "bitget".into(),
-            price: mark,
-            change24h: if margin > 0.0 { lifetime_pnl / margin * 100.0 } else { 0.0 },
-            quote_volume: 0.0,
-            high24h: mark,
-            low24h: open_utc,
-            position_value: total * mark,
-            daily_pnl: pnl,
-            unrealized_pnl: Some(lifetime_pnl),
-            realized_pnl,
-            pnl_source: Some("exchange".into()),
-        });
+        result.push(coin);
     }
     for (symbol, pnl) in realized_by_symbol {
         if pnl.abs() < 0.000001 { continue; }
         let base = symbol.trim_end_matches("USDT").to_uppercase();
         let ticker = futures_ticker_map.get(&symbol);
         let mark = ticker.map(|t| parse_number(&t.mark_price)).unwrap_or(0.0);
-        result.push(PortfolioCoin { symbol: format!("{symbol}-CLOSED"), base: format!("{base}·R"), exchange: "bitget".into(), price: mark, change24h: 0.0, quote_volume: 0.0, high24h: mark, low24h: mark, position_value: pnl.abs().max(1.0), daily_pnl: pnl, unrealized_pnl: Some(0.0), realized_pnl: Some(pnl), pnl_source: Some("exchange".into()) });
+        result.push(PortfolioCoin { symbol: format!("{symbol}-CLOSED"), base: format!("{base}·R"), exchange: "bitget".into(), price: mark, change24h: 0.0, quote_volume: 0.0, high24h: mark, low24h: mark, position_value: pnl.abs().max(1.0), daily_pnl: pnl, unrealized_pnl: Some(0.0), realized_pnl: Some(pnl), pnl_source: Some("exchange".into()), ..PortfolioCoin::default() });
     }
     if let Some(balance) = futures_balance.as_mut() {
         if open_futures_count > 0 { balance.unrealized_pnl = exchange_unrealized_total; }
@@ -608,6 +666,16 @@ async fn portfolio(credentials: &BitgetCredentials) -> Result<PortfolioResponse,
     }
     result.sort_by(|a, b| b.position_value.total_cmp(&a.position_value));
     Ok(PortfolioResponse { positions: result, futures_balance })
+}
+
+async fn live_contracts(credentials: &BitgetCredentials) -> Result<Vec<PortfolioCoin>, String> {
+    let futures = get_all_futures(credentials).await
+        .map_err(|error| format!("Bitget live futures positions: {error}"))?;
+    let mut contracts: Vec<PortfolioCoin> = futures.iter()
+        .filter_map(|position| futures_position_coin(position, None, 0.0))
+        .collect();
+    contracts.sort_by(|a, b| b.position_value.total_cmp(&a.position_value));
+    Ok(contracts)
 }
 
 #[tauri::command]
@@ -649,6 +717,12 @@ async fn refresh_bitget(state: tauri::State<'_, BitgetState>, app: tauri::AppHan
 }
 
 #[tauri::command]
+async fn refresh_bitget_contracts(state: tauri::State<'_, BitgetState>) -> Result<Vec<PortfolioCoin>, String> {
+    let credentials = state.0.lock().map_err(|_| "Credential state error".to_string())?.clone().ok_or("Bitget is not connected")?;
+    live_contracts(&credentials).await
+}
+
+#[tauri::command]
 fn disconnect_bitget(state: tauri::State<'_, BitgetState>) -> Result<(), String> {
     *state.0.lock().map_err(|_| "Credential state error".to_string())? = None;
     Ok(())
@@ -666,7 +740,7 @@ fn clear_history(app: tauri::AppHandle) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(BitgetState::default())
-        .invoke_handler(tauri::generate_handler![connect_bitget, login_bitget, has_saved_login, delete_saved_login, refresh_bitget, disconnect_bitget, load_history, clear_history])
+        .invoke_handler(tauri::generate_handler![connect_bitget, login_bitget, has_saved_login, delete_saved_login, refresh_bitget, refresh_bitget_contracts, disconnect_bitget, load_history, clear_history])
         .run(tauri::generate_context!())
         .expect("error while running Trading Journal");
 }
@@ -676,7 +750,7 @@ mod tests {
     use super::*;
 
     fn coin(pnl: f64, value: f64) -> PortfolioCoin {
-        PortfolioCoin { symbol: "BTCUSDT".into(), base: "BTC".into(), exchange: "bitget".into(), price: 100.0, change24h: 1.0, quote_volume: 10.0, high24h: 105.0, low24h: 95.0, position_value: value, daily_pnl: pnl, unrealized_pnl: Some(pnl), realized_pnl: Some(0.0), pnl_source: Some("exchange".into()) }
+        PortfolioCoin { symbol: "BTCUSDT".into(), base: "BTC".into(), exchange: "bitget".into(), price: 100.0, change24h: 1.0, quote_volume: 10.0, high24h: 105.0, low24h: 95.0, position_value: value, daily_pnl: pnl, unrealized_pnl: Some(pnl), realized_pnl: Some(0.0), pnl_source: Some("exchange".into()), ..PortfolioCoin::default() }
     }
 
     #[test]
@@ -771,11 +845,15 @@ mod tests {
 
     #[test]
     fn uta_position_response_deserializes_current_contract() {
-        let payload: ApiResponse<UtaPositionData> = serde_json::from_str(r#"{"code":"00000","msg":"success","data":{"list":[{"symbol":"BTCUSDT","posSide":"short","positionBalance":"120","total":"0.01","unrealisedPnl":"4.5","markPrice":"90000"}]}}"#).unwrap();
-        let position = &payload.data.list[0];
+        let payload: ApiResponse<UtaPositionData> = serde_json::from_str(r#"{"code":"00000","msg":"success","data":{"list":[{"symbol":"BTCUSDT","posSide":"short","positionBalance":"120","total":"0.01","unrealisedPnl":"4.5","markPrice":"90000","avgPrice":"89500","leverage":"6","liquidationPrice":"101000","marginMode":"isolated","profitRate":"0.0375","updatedTime":"1760000000000"}]}}"#).unwrap();
+        let position = normalize_uta_position(payload.data.list.into_iter().next().unwrap());
         assert_eq!(position.symbol, "BTCUSDT");
-        assert_eq!(position.pos_side, "short");
-        assert_eq!(position.position_balance, "120");
+        assert_eq!(position.hold_side, "short");
+        assert_eq!(position.margin_size, "120");
+        assert_eq!(position.open_price_avg, "89500");
+        assert_eq!(position.leverage, "6");
+        assert_eq!(position.profit_rate, "0.0375");
+        assert_eq!(position.u_time, "1760000000000");
     }
 
     #[test]
@@ -794,6 +872,26 @@ mod tests {
         assert_eq!(positions[0].total, "0.2");
         assert!(positions[0].unrealized_pl.is_empty());
         assert!(positions[0].mark_price.is_empty());
+    }
+
+    #[test]
+    fn live_contract_maps_exchange_position_metrics() {
+        let position = FuturesPosition {
+            symbol: "ETHUSDT".into(), hold_side: "short".into(), margin_size: "50".into(), total: "0.2".into(),
+            unrealized_pl: "3.5".into(), mark_price: "1995".into(), open_price_avg: "2012.5".into(),
+            leverage: "5".into(), liquidation_price: "2300".into(), margin_mode: "isolated".into(),
+            profit_rate: "0.07".into(), u_time: "1760000000000".into(),
+        };
+        let contract = futures_position_coin(&position, Some(1.0), 0.0).unwrap();
+        assert_eq!(contract.symbol, "ETHUSDT-SHORT");
+        assert_eq!(contract.side.as_deref(), Some("SHORT"));
+        assert_eq!(contract.quantity, Some(0.2));
+        assert_eq!(contract.entry_price, Some(2012.5));
+        assert_eq!(contract.mark_price, Some(1995.0));
+        assert_eq!(contract.unrealized_pnl, Some(3.5));
+        assert_eq!(contract.daily_pnl, 4.5);
+        assert_eq!(contract.roi, Some(7.0));
+        assert_eq!(contract.position_updated_at, Some(1_760_000_000_000));
     }
 
     #[test]

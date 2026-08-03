@@ -7,9 +7,9 @@ Cross-platform crypto trading journal for **Windows, macOS, iOS, and Android**. 
 - Binance and Bitget live public market heatmaps.
 - Bitget read-only account connection using API key, secret, and passphrase.
 - USDT futures equity, available balance, locked margin, exchange unrealized P&L, and UTC-day realized P&L.
-- Current USDT futures contracts with long/short side, quantity, mark-price value, and actual unrealized P&L.
+- Live USDT futures cards with long/short side, quantity, entry/mark/liquidation prices, leverage, margin, ROI, and exchange unrealized P&L.
 - Current spot crypto holdings with quantity, price, value, and market 24-hour change; spot P&L is shown as N/A when no cost basis is available.
-- Automatic account refresh every 10 seconds, profit snapshots, and past heatmap review.
+- Open-contract P&L refresh every 2 seconds, full account/realized-P&L sync every 30 seconds, profit snapshots, and past heatmap review.
 - Encrypted saved Bitget login protected by the user's Trading Journal password.
 - **Trading Notes:** upload a chart screenshot, record symbol/market/direction/setup/review, search history, reopen past notes, and delete notes.
 - Responsive desktop and phone layouts.
@@ -231,7 +231,7 @@ TradingView labels ending in `PERP` are normalized generically to Bitget REST sy
 - **Unrealized P&L** comes directly from every open Bitget futures position. Account totals also include both cross-margin and isolated-margin unrealized P&L when Bitget omits its aggregate field.
 - **UTC-day realized P&L** is calculated from every paginated Bitget Classic account bill or UTA financial record as `amount + fee`. Closing settlements, trading fees, funding fees, and other P&L bills are included; transfers, asset conversions, margin changes, and gifts are excluded.
 - **Actual net P&L** is unrealized P&L plus UTC-day realized P&L. If the private bill endpoint is unavailable, realized and net values display `N/A` rather than substituting zero.
-- Connected account data and public heatmaps refresh every 10 seconds. Refresh requests are guarded against overlap. After an API error, the dashboard marks the data as paused/stale and keeps the last confirmed timestamp visible.
+- Open Bitget contracts use a lightweight private-position refresh every 2 seconds, while account balances, UTC realized P&L, spot holdings, and history perform a full refresh every 30 seconds. Requests are guarded against overlap. After an API error, the dashboard marks the data as paused/stale and keeps the last confirmed timestamp visible.
 - Spot holdings do not expose acquisition cost through the balance endpoint, so the connected spot view reports actual quantity/value and market 24-hour change without inventing a dollar P&L.
 - New history snapshots store unrealized, realized, and net P&L separately. Older estimated snapshots remain visible with a `Legacy` label and are excluded from the actual-P&L chart.
 

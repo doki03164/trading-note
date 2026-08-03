@@ -15,6 +15,16 @@ export interface MarketCoin {
   unrealizedPnl?: number;
   realizedPnl?: number;
   pnlSource?: PnlSource;
+  side?: 'LONG' | 'SHORT';
+  quantity?: number;
+  margin?: number;
+  entryPrice?: number;
+  markPrice?: number;
+  leverage?: number;
+  liquidationPrice?: number | null;
+  marginMode?: string;
+  roi?: number;
+  positionUpdatedAt?: number | null;
 }
 
 export interface FuturesBalance {
