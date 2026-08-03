@@ -82,7 +82,7 @@ export function BackupModal({ onClose, onImported }: Props) {
 
       {error && <div className="backup-message error">{error}</div>}
       {success && <div className="backup-message success"><CheckCircle2 size={15}/><span>{success}</span></div>}
-      {summary && <Summary value={summary}/>} 
+      {summary && <Summary value={summary}/>}
     </section>
   </div>;
 }
