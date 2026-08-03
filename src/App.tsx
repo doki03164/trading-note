@@ -7,8 +7,10 @@ import { TradeLog } from './components/TradeLog';
 import { Reports } from './components/Reports';
 import { Playbooks } from './components/Playbooks';
 import { CloudAccount } from './components/CloudAccount';
+import { RemoteSyncModal } from './components/RemoteSyncModal';
 import { useMarkets } from './hooks/useMarkets';
 import { clearProfitHistory, connectBitgetAccount, deleteSavedBitgetLogin, disconnectBitgetAccount, hasSavedBitgetLogin, loadProfitHistory, loginBitgetAccount, mergeLiveContracts, refreshBitgetAccount, refreshBitgetContracts } from './services/accountBridge';
+import { connectRemoteHub, disconnectRemoteHub, loadSavedRemoteHub, refreshRemoteHub, type RemoteSyncEnvelope } from './services/remoteSync';
 import type { Exchange, FuturesBalance, MarketCoin, ProfitHistoryEntry, SizeMetric, TimeRange } from './types';
 import './styles.css';
 
@@ -29,6 +31,8 @@ export default function App() {
   const [selected, setSelected] = useState<MarketCoin>();
   const [mobileMenu, setMobileMenu] = useState(false);
   const [connectOpen, setConnectOpen] = useState(false);
+  const [remoteOpen, setRemoteOpen] = useState(() => new URLSearchParams(window.location.search).get('sync') === '1');
+  const [remoteConnected, setRemoteConnected] = useState(false);
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
   const [passphrase, setPassphrase] = useState('');
@@ -50,7 +54,7 @@ export default function App() {
   const [historySnapshot, setHistorySnapshot] = useState<ProfitHistoryEntry>();
   const accountRequestInFlight = useRef(false);
   const market = useMarkets(exchange);
-  const usingAccount = exchange === 'bitget' && bitgetConnected;
+  const usingAccount = exchange === 'bitget' && (bitgetConnected || remoteConnected);
   const data = usingAccount ? apiData : market.data;
   const loading = usingAccount ? apiLoading : market.loading;
   const live = usingAccount ? accountLive : market.live;
@@ -60,8 +64,34 @@ export default function App() {
     try { const items = await loadProfitHistory(); setHistory(items); setHistorySnapshot(current => current ?? items.at(-1)); } catch { setHistory([]); }
   }
 
+  function applyRemotePayload(payload: RemoteSyncEnvelope) {
+    if (!payload.snapshot) return;
+    const confirmedAt = new Date(payload.generatedAt || Date.now());
+    setApiData(payload.snapshot.positions); setFuturesBalance(payload.snapshot.futuresBalance ?? undefined);
+    setHistory(payload.history); setHistorySnapshot(current => current ?? payload.history.at(-1));
+    setRemoteConnected(true); setBitgetConnected(false); setExchange('bitget'); setAccountLive(true);
+    setApiUpdatedAt(confirmedAt); setAccountUpdatedAt(confirmedAt); setApiError('');
+  }
+
   useEffect(() => { loadHistory(); hasSavedBitgetLogin().then(saved => { setHasSavedLogin(saved); setUseSavedLogin(saved); }).catch(() => {}); }, []);
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1_000); return () => window.clearInterval(timer); }, []);
+  useEffect(() => {
+    const saved = loadSavedRemoteHub();
+    if (saved) connectRemoteHub(saved.url, saved.token, true).then(applyRemotePayload).catch(() => disconnectRemoteHub(false));
+  }, []);
+
+  useEffect(() => {
+    if (!remoteConnected) return;
+    let stopped = false;
+    const poll = async () => {
+      setLiveSyncing(true);
+      try { const payload = await refreshRemoteHub(); if (!stopped) applyRemotePayload(payload); }
+      catch (error) { if (!stopped) { setApiError(`Desktop sync: ${String(error)}`); setAccountLive(false); } }
+      finally { if (!stopped) setLiveSyncing(false); }
+    };
+    const timer = window.setInterval(poll, CONTRACT_REFRESH_MS);
+    return () => { stopped = true; window.clearInterval(timer); };
+  }, [remoteConnected]);
 
   useEffect(() => {
     if (!bitgetConnected) return;
@@ -102,6 +132,7 @@ export default function App() {
     event.preventDefault(); setApiError(''); setApiLoading(true);
     try {
       const snapshot = await connectBitgetAccount({ apiKey, apiSecret, passphrase }, saveLogin, saveLogin ? loginPassword : null);
+      disconnectRemoteHub(false); setRemoteConnected(false);
       const confirmedAt = new Date();
       setApiData(snapshot.positions); setFuturesBalance(snapshot.futuresBalance ?? undefined); setBitgetConnected(true); setAccountLive(true); setApiUpdatedAt(confirmedAt); setAccountUpdatedAt(confirmedAt); setExchange('bitget');
       await loadHistory();
@@ -115,6 +146,7 @@ export default function App() {
     event.preventDefault(); setApiError(''); setApiLoading(true);
     try {
       const snapshot = await loginBitgetAccount(loginPassword);
+      disconnectRemoteHub(false); setRemoteConnected(false);
       const confirmedAt = new Date();
       setApiData(snapshot.positions); setFuturesBalance(snapshot.futuresBalance ?? undefined); setBitgetConnected(true); setAccountLive(true); setApiUpdatedAt(confirmedAt); setAccountUpdatedAt(confirmedAt); setExchange('bitget');
       setLoginPassword(''); setConnectOpen(false); await loadHistory();
@@ -128,6 +160,13 @@ export default function App() {
 
   async function refresh() {
     if (!usingAccount) { await market.refresh(); return; }
+    if (remoteConnected) {
+      setLiveSyncing(true); setApiError('');
+      try { applyRemotePayload(await refreshRemoteHub()); }
+      catch (error) { setApiError(`Desktop sync: ${String(error)}`); setAccountLive(false); }
+      finally { setLiveSyncing(false); }
+      return;
+    }
     if (accountRequestInFlight.current) return;
     accountRequestInFlight.current = true;
     setApiLoading(true); setApiError('');
@@ -140,7 +179,12 @@ export default function App() {
     await disconnectBitgetAccount(); setBitgetConnected(false); setAccountLive(false); setApiData([]); setFuturesBalance(undefined); setApiUpdatedAt(undefined); setAccountUpdatedAt(undefined); setExchange('binance');
   }
 
+  function disconnectRemote() {
+    disconnectRemoteHub(false); setRemoteConnected(false); setAccountLive(false); setApiData([]); setFuturesBalance(undefined); setApiUpdatedAt(undefined); setAccountUpdatedAt(undefined); setExchange('binance');
+  }
+
   async function clearHistory() {
+    if (remoteConnected) { window.alert('Remote history is read-only. Clear it from the connected desktop app.'); return; }
     if (!window.confirm('Delete all saved profit history?')) return;
     await clearProfitHistory(); setHistory([]);
   }
@@ -168,20 +212,23 @@ export default function App() {
 
   return <div className="app-shell">
     <header className="topbar">
-      <div className="brand"><div className="brand-mark"><img src="/app-icon.png" alt=""/></div><span>Trading <span>Journal</span></span></div>
+      <div className="brand"><div className="brand-mark"><img src={`${import.meta.env.BASE_URL}app-icon.png`} alt=""/></div><span>Trading <span>Journal</span></span></div>
       <nav className={mobileMenu ? 'open' : ''}>
         <button className={view === 'heatmap' ? 'nav-active' : ''} onClick={() => setView('heatmap')}><LayoutGrid size={16}/> Heatmap</button>
         <button className={view === 'trades' ? 'nav-active' : ''} onClick={() => setView('trades')}><List size={16}/> Trade Log</button>
         <button className={view === 'reports' ? 'nav-active' : ''} onClick={() => setView('reports')}><BarChart3 size={16}/> Reports</button>
-        <button className={view === 'history' ? 'nav-active' : ''} onClick={() => { setView('history'); loadHistory(); }}><History size={16}/> History</button>
+        <button className={view === 'history' ? 'nav-active' : ''} onClick={() => { setView('history'); if (!remoteConnected) loadHistory(); }}><History size={16}/> History</button>
         <button className={view === 'notes' ? 'nav-active' : ''} onClick={() => setView('notes')}><NotebookPen size={16}/> Trading Notes</button>
         <button className={view === 'playbooks' ? 'nav-active' : ''} onClick={() => setView('playbooks')}><BookOpen size={16}/> Playbooks</button>
         <button className={view === 'cloud' ? 'nav-active' : ''} onClick={() => setView('cloud')}><Cloud size={16}/> Cloud</button>
       </nav>
       <div className="top-actions">
-        {bitgetConnected
-          ? <button className="api-connected" onClick={disconnectBitget}><ShieldCheck size={14}/> Bitget connected <LogOut size={13}/></button>
-          : <button className="connect-api" onClick={() => { setUseSavedLogin(hasSavedLogin); setConnectOpen(true); }}><KeyRound size={14}/> {hasSavedLogin ? 'Unlock Bitget' : 'Connect Bitget'}</button>}
+        {remoteConnected
+          ? <button className="api-connected remote-connected" onClick={disconnectRemote}><Radio size={14}/> Desktop live <LogOut size={13}/></button>
+          : bitgetConnected
+            ? <button className="api-connected" onClick={disconnectBitget}><ShieldCheck size={14}/> Bitget connected <LogOut size={13}/></button>
+            : <button className="connect-api" onClick={() => { setUseSavedLogin(hasSavedLogin); setConnectOpen(true); }}><KeyRound size={14}/> {hasSavedLogin ? 'Unlock Bitget' : 'Connect Bitget'}</button>}
+        <button className="sync-hub-button" onClick={() => setRemoteOpen(true)}><Radio size={14}/> Sync</button>
         <button className="icon-button"><Search size={18}/></button><button className="icon-button"><Bell size={18}/><i/></button>
         <button className="avatar">AG</button>
         <button className="menu-toggle" onClick={() => setMobileMenu(v => !v)}>{mobileMenu ? <X/> : <Command/>}</button>
@@ -191,12 +238,12 @@ export default function App() {
     <main>
       <section className="page-heading">
         <div><div className="eyebrow"><span/> TRADING PERFORMANCE INTELLIGENCE</div><h1>{{heatmap:'Daily Profit Heatmap',trades:'Trade Log',reports:'Performance Reports',history:'Profit History',notes:'Trading Notes',playbooks:'Strategy Playbooks',cloud:'Cloud Database'}[view]}</h1><p>{{heatmap:'See exactly where today’s portfolio profit and loss comes from.',trades:'Log executions, fees, risk and setup context in one searchable database.',reports:'Measure win rate, expectancy, profit factor and strategy performance.',history:'Review locally saved Bitget P&L snapshots over time.',notes:'Upload chart screenshots and review your past trading decisions.',playbooks:'Define repeatable setups and review their actual results.',cloud:'Synchronize your private journal across every installed device.'}[view]}</p></div>
-        <div className={`connection ${live ? '' : 'offline'} ${liveSyncing ? 'syncing' : ''}`}>{usingAccount ? <Radio size={14}/> : live ? <Wifi size={14}/> : <WifiOff size={14}/>}<span>{usingAccount ? live ? 'Contract P&L · 2s live' : 'Contract refresh paused' : live ? `Live ${exchange} market data` : "Can't connect to API"}</span><small>{usingAccount && liveAge != null ? `${liveAge}s ago` : updatedAt?.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</small></div>
+        <div className={`connection ${live ? '' : 'offline'} ${liveSyncing ? 'syncing' : ''}`}>{usingAccount ? <Radio size={14}/> : live ? <Wifi size={14}/> : <WifiOff size={14}/>}<span>{remoteConnected ? live ? 'PC / Mac sync · 2s live' : 'Desktop sync paused' : usingAccount ? live ? 'Contract P&L · 2s live' : 'Contract refresh paused' : live ? `Live ${exchange} market data` : "Can't connect to API"}</span><small>{usingAccount && liveAge != null ? `${liveAge}s ago` : updatedAt?.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</small></div>
       </section>
 
       {view === 'heatmap' ? <>
       {!usingAccount && market.error && <div className="market-api-error"><WifiOff size={18}/><div><strong>Can't connect to API</strong><span>{market.error}</span></div><button onClick={market.refresh}>Retry</button></div>}
-      {usingAccount && apiError && <div className="market-api-error"><WifiOff size={18}/><div><strong>Bitget live refresh paused</strong><span>{apiError} · showing data confirmed at {apiUpdatedAt?.toLocaleTimeString()}</span></div><button onClick={refresh}>Retry</button></div>}
+      {usingAccount && apiError && <div className="market-api-error"><WifiOff size={18}/><div><strong>{remoteConnected ? 'Desktop sync paused' : 'Bitget live refresh paused'}</strong><span>{apiError} · showing data confirmed at {apiUpdatedAt?.toLocaleTimeString()}</span></div><button onClick={refresh}>Retry</button></div>}
       <section className={`stat-row ${usingAccount ? 'account-stats' : ''}`}>
         {usingAccount ? <>
           <article><div><span>UNREALIZED P&amp;L</span><strong className={stats.unrealized >= 0 ? 'profit-text' : 'loss-text'}>{fmtPnl(stats.unrealized)}</strong><em className="muted">Direct from open Bitget positions</em></div><div className="mini-chart"><Sparkline positive={stats.unrealized >= 0}/></div></article>
@@ -262,7 +309,7 @@ export default function App() {
 
       <section className="workspace">
         <div className="toolbar">
-          <div className="segmented exchange-tabs"><button className={exchange === 'binance' ? 'active' : ''} onClick={() => setExchange('binance')}><b className="binance-dot">◆</b> Binance</button><button className={exchange === 'bitget' ? 'active' : ''} onClick={() => setExchange('bitget')}><b className="bitget-dot">⇄</b> Bitget {bitgetConnected && <i className="account-dot"/>}</button></div>
+          <div className="segmented exchange-tabs"><button className={exchange === 'binance' ? 'active' : ''} onClick={() => setExchange('binance')}><b className="binance-dot">◆</b> Binance</button><button className={exchange === 'bitget' ? 'active' : ''} onClick={() => setExchange('bitget')}><b className="bitget-dot">⇄</b> Bitget {(bitgetConnected || remoteConnected) && <i className="account-dot"/>}</button></div>
           <div className="toolbar-right">
             <div className="searchbox"><Search size={15}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search asset"/><kbd>⌘K</kbd></div>
             <div className="segmented range-tabs">{ranges.map(r => <button key={r} className={range === r ? 'active' : ''} onClick={() => setRange(r)}>{r}</button>)}</div>
@@ -278,7 +325,7 @@ export default function App() {
         </div>
       </section>
       </> : view === 'history' ? <section className="history-workspace">
-        <div className="history-toolbar"><div><CalendarDays size={17}/><span>Saved locally</span><small>Automatic snapshot every 5 minutes while connected</small></div><div><button onClick={loadHistory}><RefreshCw size={14}/> Reload</button><button className="danger" onClick={clearHistory}><Trash2 size={14}/> Clear history</button></div></div>
+        <div className="history-toolbar"><div><CalendarDays size={17}/><span>{remoteConnected ? 'Synced from desktop' : 'Saved locally'}</span><small>Automatic snapshot every 5 minutes while connected</small></div><div><button onClick={remoteConnected ? refresh : loadHistory}><RefreshCw size={14}/> Reload</button><button className="danger" onClick={clearHistory} disabled={remoteConnected}><Trash2 size={14}/> Clear history</button></div></div>
         {history.length ? <>
           <div className="history-summary"><article><span>SNAPSHOTS</span><strong>{history.length}</strong></article><article><span>LATEST UNREALIZED</span><strong className={(history.at(-1)!.unrealizedPnl ?? 0) >= 0 ? 'positive' : 'negative'}>{history.at(-1)!.unrealizedPnl == null ? 'Legacy' : fmtPnl(history.at(-1)!.unrealizedPnl!)}</strong></article><article><span>LATEST REALIZED</span><strong className={history.at(-1)!.realizedPnl == null ? 'muted' : history.at(-1)!.realizedPnl! >= 0 ? 'positive' : 'negative'}>{history.at(-1)!.realizedPnl == null ? 'N/A' : fmtPnl(history.at(-1)!.realizedPnl!)}</strong></article><article><span>TRACKING SINCE</span><strong>{new Date(history[0].timestamp).toLocaleDateString()}</strong></article></div>
           {historySnapshot && <div className="history-heatmap-section"><div className="history-map-title"><div><span>SAVED HEATMAP</span><strong>{new Date(historySnapshot.timestamp).toLocaleString()}</strong></div><em className={historySnapshot.unrealizedPnl == null ? 'muted' : historySnapshot.totalPnl >= 0 ? 'positive' : 'negative'}>{historySnapshot.unrealizedPnl == null ? 'Legacy estimated snapshot' : `${fmtPnl(historySnapshot.totalPnl)} actual net P&L`}</em></div><div className="history-heatmap"><HeatMap data={historySnapshot.positions} sizeMetric="position" selected={selected} onSelect={setSelected}/></div></div>}
@@ -324,6 +371,8 @@ export default function App() {
       </form>
     </div>}
 
-    <footer><span><CircleHelp size={14}/> Contract P&amp;L refreshes every 2s · account data every 30s</span><span><Settings2 size={14}/> v0.3.0</span></footer>
+    {remoteOpen && <RemoteSyncModal onClose={() => setRemoteOpen(false)} onRemoteConnected={applyRemotePayload}/>}
+
+    <footer><span><CircleHelp size={14}/> Contract P&amp;L refreshes every 2s · desktop sync is read-only</span><span><Settings2 size={14}/> v0.3.1</span></footer>
   </div>;
 }

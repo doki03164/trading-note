@@ -97,6 +97,34 @@ npm run dev
 
 Open the local URL printed by Vite. The web preview supports public heatmaps and Trading Notes. Native iOS/Android containers use Capacitor HTTP for signed account requests.
 
+## Install the Web App
+
+The hosted dashboard is available at:
+
+- Web App: <https://doki03164.github.io/trading-note/>
+- Installation portal: <https://doki03164.github.io/trading-note/?install=1>
+
+The installation portal detects iOS/Android, provides the current description profile, IPA, APK, and desktop downloads, and explains how to add the Web App to the Home Screen. The Web App includes a manifest, Apple mobile-web-app metadata, and a service worker for the cached application shell.
+
+### Sync the Web App from a PC or Mac
+
+The desktop app can act as a read-only data hub so the Web App receives the same Bitget positions, futures balance, unrealized P&L, and saved profit history without copying the Bitget API secret to the browser.
+
+1. Open **Sync** in the Windows or macOS app and select **Start data hub**.
+2. Install `cloudflared`, then run the exact Quick Tunnel command shown by the desktop app. The gateway binds only to `127.0.0.1` and uses port `45831` by default.
+3. Copy the generated `https://...trycloudflare.com` URL.
+4. Open **Sync** in the Web App and enter that HTTPS URL plus the 48-character pairing token shown by the desktop app.
+5. The Web App requests the authenticated, read-only `/v1/sync` endpoint every two seconds. Stop the gateway or the `cloudflared` process to end remote access immediately.
+
+The pairing token is generated again whenever the desktop gateway restarts. The gateway exposes no write endpoint and never returns API credentials. Quick Tunnels are convenient for temporary use; configure a named Cloudflare Tunnel for a stable production hostname.
+
+Build the GitHub Pages version locally with the repository base path:
+
+```bash
+npm run ios:profile
+npm run build:web
+```
+
 ## Build and install Windows desktop
 
 Development:
@@ -166,7 +194,7 @@ For Google Play, create a signing key in Android Studio and use **Build ??Genera
 
 The release provides two iOS packages:
 
-1. **Description profile:** `Trading-Journal.mobileconfig` installs a removable Trading Journal Home Screen entry that opens the current release/install page. On iPhone, download the file, open **Settings > Profile Downloaded**, inspect the displayed publisher and payload, then tap **Install**.
+1. **Description profile:** `Trading-Journal.mobileconfig` installs a removable Trading Journal Home Screen entry that opens the hosted Web App. Download it from the [Web installation portal](https://doki03164.github.io/trading-note/?install=1), open **Settings > Profile Downloaded**, inspect the displayed publisher and payload, then tap **Install**.
 2. **Native IPA:** `Trading-Journal-iOS-unsigned.ipa` is a real arm64 device build packaged for re-signing. Install it with an Apple Account through AltStore/Sideloadly, or sign it with your Apple Developer certificate and provisioning profile before device/MDM distribution. The bundle identifier is `com.pulsegrid.app`.
 
 The description profile is a lightweight release shortcut; the IPA is the full native Trading Journal application. Apple ties native iPhone installation to the installer's signing identity and registered device. The GitHub artifact deliberately contains no shared signing certificate or private key.

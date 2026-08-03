@@ -1,11 +1,12 @@
 {
   "name": "trading-journal",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:web": "tsc -b && vite build --base=/trading-note/",
     "preview": "vite preview",
     "test": "vitest run",
     "desktop:dev": "tauri dev",

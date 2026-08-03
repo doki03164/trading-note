@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const outputPath = resolve(root, 'ios/distribution/Trading-Journal.mobileconfig');
+const webOutputPath = resolve(root, 'public/Trading-Journal.mobileconfig');
 const packageJson = JSON.parse(await readFile(resolve(root, 'package.json'), 'utf8'));
 const icon = (await readFile(resolve(root, 'src-tauri/icons/icon.png'))).toString('base64');
 const wrappedIcon = icon.match(/.{1,68}/g)?.join('\n          ') ?? icon;
@@ -42,7 +43,7 @@ const profile = `<?xml version="1.0" encoding="UTF-8"?>
       <key>Precomposed</key>
       <true/>
       <key>URL</key>
-      <string>https://github.com/doki03164/trading-note/releases/latest</string>
+      <string>https://doki03164.github.io/trading-note/</string>
     </dict>
   </array>
   <key>PayloadDescription</key>
@@ -67,4 +68,5 @@ const profile = `<?xml version="1.0" encoding="UTF-8"?>
 
 await mkdir(dirname(outputPath), { recursive: true });
 await writeFile(outputPath, profile, 'utf8');
-console.log(`Generated ${outputPath}`);
+await writeFile(webOutputPath, profile, 'utf8');
+console.log(`Generated ${outputPath} and ${webOutputPath}`);

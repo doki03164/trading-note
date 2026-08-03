@@ -2,13 +2,19 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
 use argon2::Argon2;
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::{distr::Alphanumeric, Rng, RngCore};
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
-use std::{collections::{HashMap, HashSet}, sync::Mutex, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
+    thread::JoinHandle,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tauri::Manager;
+use tiny_http::{Header, Method, Response, Server, StatusCode};
 use zeroize::Zeroize;
 
 #[derive(Clone)]
@@ -20,8 +26,21 @@ struct SavedCredentials { api_key: String, api_secret: String, passphrase: Strin
 #[derive(Serialize, Deserialize)]
 struct CredentialVault { salt: String, nonce: String, ciphertext: String }
 
+#[derive(Clone, Default)]
+struct BitgetState(Arc<Mutex<Option<BitgetCredentials>>>);
+
+#[derive(Clone, Default)]
+struct SharedPortfolio(Arc<Mutex<Option<PortfolioResponse>>>);
+
+struct SyncGatewayRuntime {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+    port: u16,
+    token: String,
+}
+
 #[derive(Default)]
-struct BitgetState(Mutex<Option<BitgetCredentials>>);
+struct SyncGatewayState(Mutex<Option<SyncGatewayRuntime>>);
 
 #[derive(Deserialize)]
 struct ApiResponse<T> { code: String, #[serde(default)] msg: String, data: T }
@@ -196,6 +215,63 @@ struct HistoryEntry {
     #[serde(default)] realized_pnl: Option<f64>,
     portfolio_value: f64,
     positions: Vec<PortfolioCoin>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncGatewayStatus {
+    running: bool,
+    port: u16,
+    local_url: String,
+    pairing_token: String,
+    tunnel_command: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncEnvelope {
+    version: &'static str,
+    generated_at: u128,
+    snapshot: Option<PortfolioResponse>,
+    history: Vec<HistoryEntry>,
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
+}
+
+fn sync_token_matches(header: Option<&str>, expected: &str) -> bool {
+    header.and_then(|value| value.strip_prefix("Bearer ")).is_some_and(|value| value == expected)
+}
+
+fn json_header(name: &str, value: &str) -> Header {
+    Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static HTTP header")
+}
+
+fn gateway_status(runtime: &SyncGatewayRuntime) -> SyncGatewayStatus {
+    SyncGatewayStatus {
+        running: true,
+        port: runtime.port,
+        local_url: format!("http://127.0.0.1:{}", runtime.port),
+        pairing_token: runtime.token.clone(),
+        tunnel_command: format!("cloudflared tunnel --url http://127.0.0.1:{}", runtime.port),
+    }
+}
+
+fn merge_shared_contracts(snapshot: &mut PortfolioResponse, mut contracts: Vec<PortfolioCoin>) {
+    let prior: HashMap<String, PortfolioCoin> = snapshot.positions.iter().filter(|item| item.side.is_some()).map(|item| (item.symbol.clone(), item.clone())).collect();
+    for contract in &mut contracts {
+        if let Some(previous) = prior.get(&contract.symbol) {
+            contract.realized_pnl = previous.realized_pnl;
+            contract.daily_pnl = contract.unrealized_pnl.unwrap_or_default() + previous.realized_pnl.unwrap_or_default();
+        }
+    }
+    snapshot.positions.retain(|item| item.side.is_none());
+    snapshot.positions.extend(contracts);
+    snapshot.positions.sort_by(|a, b| b.position_value.total_cmp(&a.position_value));
+    if let Some(balance) = &mut snapshot.futures_balance {
+        balance.unrealized_pnl = snapshot.positions.iter().filter(|item| item.side.is_some()).map(|item| item.unrealized_pnl.unwrap_or_default()).sum();
+    }
 }
 
 fn history_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -678,23 +754,124 @@ async fn live_contracts(credentials: &BitgetCredentials) -> Result<Vec<Portfolio
     Ok(contracts)
 }
 
+fn respond_gateway_request(request: tiny_http::Request, token: &str, shared: &Arc<Mutex<Option<PortfolioResponse>>>, app: &tauri::AppHandle) {
+    let method = request.method().clone();
+    let path = request.url().split('?').next().unwrap_or_default().to_string();
+    let authorization = request.headers().iter().find(|header| header.field.equiv("Authorization")).map(|header| header.value.as_str().to_string());
+    let cors = json_header("Access-Control-Allow-Origin", "*");
+    let no_store = json_header("Cache-Control", "no-store");
+    let content_type = json_header("Content-Type", "application/json; charset=utf-8");
+
+    if method == Method::Options {
+        let response = Response::empty(StatusCode(204))
+            .with_header(cors)
+            .with_header(json_header("Access-Control-Allow-Methods", "GET, OPTIONS"))
+            .with_header(json_header("Access-Control-Allow-Headers", "Authorization, Content-Type"))
+            .with_header(json_header("Access-Control-Max-Age", "600"));
+        let _ = request.respond(response);
+        return;
+    }
+
+    if method == Method::Get && path == "/health" {
+        let response = Response::from_string(r#"{"status":"ok","version":"0.3.1"}"#)
+            .with_status_code(StatusCode(200)).with_header(cors).with_header(no_store).with_header(content_type);
+        let _ = request.respond(response);
+        return;
+    }
+
+    if method != Method::Get || path != "/v1/sync" {
+        let response = Response::from_string(r#"{"error":"not_found"}"#)
+            .with_status_code(StatusCode(404)).with_header(cors).with_header(no_store).with_header(content_type);
+        let _ = request.respond(response);
+        return;
+    }
+
+    if !sync_token_matches(authorization.as_deref(), token) {
+        let response = Response::from_string(r#"{"error":"unauthorized"}"#)
+            .with_status_code(StatusCode(401)).with_header(cors).with_header(no_store).with_header(content_type);
+        let _ = request.respond(response);
+        return;
+    }
+
+    let snapshot = shared.lock().ok().and_then(|value| value.clone());
+    let history = read_history(app).unwrap_or_default();
+    let envelope = SyncEnvelope { version: "0.3.1", generated_at: now_millis(), snapshot, history };
+    match serde_json::to_string(&envelope) {
+        Ok(body) => {
+            let response = Response::from_string(body).with_status_code(StatusCode(200)).with_header(cors).with_header(no_store).with_header(content_type);
+            let _ = request.respond(response);
+        }
+        Err(_) => {
+            let response = Response::from_string(r#"{"error":"serialization_failed"}"#)
+                .with_status_code(StatusCode(500)).with_header(cors).with_header(no_store).with_header(content_type);
+            let _ = request.respond(response);
+        }
+    }
+}
+
 #[tauri::command]
-async fn connect_bitget(api_key: String, api_secret: String, passphrase: String, save_login: bool, login_password: Option<String>, state: tauri::State<'_, BitgetState>, app: tauri::AppHandle) -> Result<PortfolioResponse, String> {
+fn start_sync_gateway(port: u16, app: tauri::AppHandle, shared: tauri::State<'_, SharedPortfolio>, gateway: tauri::State<'_, SyncGatewayState>) -> Result<SyncGatewayStatus, String> {
+    if port < 1024 { return Err("Choose a port between 1024 and 65535".into()); }
+    let mut guard = gateway.0.lock().map_err(|_| "Sync gateway state error".to_string())?;
+    if let Some(runtime) = guard.as_ref() { return Ok(gateway_status(runtime)); }
+
+    let server = Server::http(("127.0.0.1", port)).map_err(|error| format!("Cannot start sync gateway on port {port}: {error}"))?;
+    let token: String = rand::rng().sample_iter(&Alphanumeric).take(48).map(char::from).collect();
+    let thread_token = token.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread_shared = shared.0.clone();
+    let thread_app = app.clone();
+    let handle = std::thread::spawn(move || {
+        while !thread_stop.load(Ordering::Relaxed) {
+            match server.recv_timeout(Duration::from_millis(250)) {
+                Ok(Some(request)) => respond_gateway_request(request, &thread_token, &thread_shared, &thread_app),
+                Ok(None) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+    let runtime = SyncGatewayRuntime { stop, handle, port, token };
+    let status = gateway_status(&runtime);
+    *guard = Some(runtime);
+    Ok(status)
+}
+
+#[tauri::command]
+fn sync_gateway_status(gateway: tauri::State<'_, SyncGatewayState>) -> Result<Option<SyncGatewayStatus>, String> {
+    let guard = gateway.0.lock().map_err(|_| "Sync gateway state error".to_string())?;
+    Ok(guard.as_ref().map(gateway_status))
+}
+
+#[tauri::command]
+fn stop_sync_gateway(gateway: tauri::State<'_, SyncGatewayState>) -> Result<(), String> {
+    let runtime = gateway.0.lock().map_err(|_| "Sync gateway state error".to_string())?.take();
+    if let Some(runtime) = runtime {
+        runtime.stop.store(true, Ordering::Relaxed);
+        runtime.handle.join().map_err(|_| "Sync gateway thread did not stop cleanly".to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn connect_bitget(api_key: String, api_secret: String, passphrase: String, save_login: bool, login_password: Option<String>, state: tauri::State<'_, BitgetState>, shared: tauri::State<'_, SharedPortfolio>, app: tauri::AppHandle) -> Result<PortfolioResponse, String> {
     if api_key.trim().is_empty() || api_secret.trim().is_empty() || passphrase.trim().is_empty() { return Err("Enter all three Bitget API fields".into()); }
     let credentials = BitgetCredentials { api_key, api_secret, passphrase };
     let result = portfolio(&credentials).await?;
     if save_login { encrypt_credentials(&app, &credentials, login_password.as_deref().unwrap_or_default())?; }
     save_snapshot(&app, &result.positions, result.futures_balance.as_ref())?;
     *state.0.lock().map_err(|_| "Credential state error".to_string())? = Some(credentials);
+    *shared.0.lock().map_err(|_| "Shared portfolio state error".to_string())? = Some(result.clone());
     Ok(result)
 }
 
 #[tauri::command]
-async fn login_bitget(login_password: String, state: tauri::State<'_, BitgetState>, app: tauri::AppHandle) -> Result<PortfolioResponse, String> {
+async fn login_bitget(login_password: String, state: tauri::State<'_, BitgetState>, shared: tauri::State<'_, SharedPortfolio>, app: tauri::AppHandle) -> Result<PortfolioResponse, String> {
     let credentials = decrypt_credentials(&app, &login_password)?;
     let result = portfolio(&credentials).await?;
     save_snapshot(&app, &result.positions, result.futures_balance.as_ref())?;
     *state.0.lock().map_err(|_| "Credential state error".to_string())? = Some(credentials);
+    *shared.0.lock().map_err(|_| "Shared portfolio state error".to_string())? = Some(result.clone());
     Ok(result)
 }
 
@@ -709,22 +886,28 @@ fn delete_saved_login(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn refresh_bitget(state: tauri::State<'_, BitgetState>, app: tauri::AppHandle) -> Result<PortfolioResponse, String> {
+async fn refresh_bitget(state: tauri::State<'_, BitgetState>, shared: tauri::State<'_, SharedPortfolio>, app: tauri::AppHandle) -> Result<PortfolioResponse, String> {
     let credentials = state.0.lock().map_err(|_| "Credential state error".to_string())?.clone().ok_or("Bitget is not connected")?;
     let result = portfolio(&credentials).await?;
     save_snapshot(&app, &result.positions, result.futures_balance.as_ref())?;
+    *shared.0.lock().map_err(|_| "Shared portfolio state error".to_string())? = Some(result.clone());
     Ok(result)
 }
 
 #[tauri::command]
-async fn refresh_bitget_contracts(state: tauri::State<'_, BitgetState>) -> Result<Vec<PortfolioCoin>, String> {
+async fn refresh_bitget_contracts(state: tauri::State<'_, BitgetState>, shared: tauri::State<'_, SharedPortfolio>) -> Result<Vec<PortfolioCoin>, String> {
     let credentials = state.0.lock().map_err(|_| "Credential state error".to_string())?.clone().ok_or("Bitget is not connected")?;
-    live_contracts(&credentials).await
+    let contracts = live_contracts(&credentials).await?;
+    if let Some(snapshot) = shared.0.lock().map_err(|_| "Shared portfolio state error".to_string())?.as_mut() {
+        merge_shared_contracts(snapshot, contracts.clone());
+    }
+    Ok(contracts)
 }
 
 #[tauri::command]
-fn disconnect_bitget(state: tauri::State<'_, BitgetState>) -> Result<(), String> {
+fn disconnect_bitget(state: tauri::State<'_, BitgetState>, shared: tauri::State<'_, SharedPortfolio>) -> Result<(), String> {
     *state.0.lock().map_err(|_| "Credential state error".to_string())? = None;
+    *shared.0.lock().map_err(|_| "Shared portfolio state error".to_string())? = None;
     Ok(())
 }
 
@@ -740,7 +923,9 @@ fn clear_history(app: tauri::AppHandle) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(BitgetState::default())
-        .invoke_handler(tauri::generate_handler![connect_bitget, login_bitget, has_saved_login, delete_saved_login, refresh_bitget, refresh_bitget_contracts, disconnect_bitget, load_history, clear_history])
+        .manage(SharedPortfolio::default())
+        .manage(SyncGatewayState::default())
+        .invoke_handler(tauri::generate_handler![connect_bitget, login_bitget, has_saved_login, delete_saved_login, refresh_bitget, refresh_bitget_contracts, disconnect_bitget, load_history, clear_history, start_sync_gateway, sync_gateway_status, stop_sync_gateway])
         .run(tauri::generate_context!())
         .expect("error while running Trading Journal");
 }
@@ -751,6 +936,26 @@ mod tests {
 
     fn coin(pnl: f64, value: f64) -> PortfolioCoin {
         PortfolioCoin { symbol: "BTCUSDT".into(), base: "BTC".into(), exchange: "bitget".into(), price: 100.0, change24h: 1.0, quote_volume: 10.0, high24h: 105.0, low24h: 95.0, position_value: value, daily_pnl: pnl, unrealized_pnl: Some(pnl), realized_pnl: Some(0.0), pnl_source: Some("exchange".into()), ..PortfolioCoin::default() }
+    }
+
+    #[test]
+    fn sync_gateway_requires_exact_bearer_token() {
+        assert!(sync_token_matches(Some("Bearer abc123"), "abc123"));
+        assert!(!sync_token_matches(Some("Bearer abc124"), "abc123"));
+        assert!(!sync_token_matches(Some("abc123"), "abc123"));
+        assert!(!sync_token_matches(None, "abc123"));
+    }
+
+    #[test]
+    fn live_contract_merge_preserves_realized_pnl() {
+        let mut prior = coin(7.0, 100.0);
+        prior.symbol = "BTCUSDT-LONG".into(); prior.side = Some("LONG".into()); prior.unrealized_pnl = Some(2.0); prior.realized_pnl = Some(5.0);
+        let mut live = prior.clone(); live.unrealized_pnl = Some(-3.0); live.realized_pnl = None; live.daily_pnl = -3.0;
+        let mut snapshot = PortfolioResponse { positions: vec![prior], futures_balance: Some(FuturesBalanceSummary::default()) };
+        merge_shared_contracts(&mut snapshot, vec![live]);
+        assert_eq!(snapshot.positions[0].realized_pnl, Some(5.0));
+        assert_eq!(snapshot.positions[0].daily_pnl, 2.0);
+        assert_eq!(snapshot.futures_balance.unwrap().unrealized_pnl, -3.0);
     }
 
     #[test]
