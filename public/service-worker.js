@@ -1,4 +1,4 @@
-const CACHE = 'trading-journal-web-v0.3.1';
+const CACHE = 'trading-journal-web-v0.3.2';
 const BASE = new URL('./', self.location.href).pathname;
 const SHELL = [BASE, `${BASE}manifest.webmanifest`, `${BASE}app-icon.png`, `${BASE}apple-touch-icon.png`];
 

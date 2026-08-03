@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDownRight, ArrowUpRight, BarChart3, Bell, BookOpen, CalendarDays, ChevronDown, CircleHelp, Cloud, Command, Expand, Gauge, History, KeyRound, LayoutGrid, List, LogOut, NotebookPen, Radio, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Trash2, WalletCards, Wifi, WifiOff, X } from 'lucide-react';
+import { ArchiveRestore, ArrowDownRight, ArrowUpRight, BarChart3, Bell, BookOpen, CalendarDays, ChevronDown, CircleHelp, Cloud, Command, Expand, Gauge, History, KeyRound, LayoutGrid, List, LogOut, NotebookPen, Radio, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Trash2, WalletCards, Wifi, WifiOff, X } from 'lucide-react';
 import { HeatMap } from './components/HeatMap';
 import { Sparkline } from './components/Sparkline';
 import { TradingNotes } from './components/TradingNotes';
@@ -8,6 +8,7 @@ import { Reports } from './components/Reports';
 import { Playbooks } from './components/Playbooks';
 import { CloudAccount } from './components/CloudAccount';
 import { RemoteSyncModal } from './components/RemoteSyncModal';
+import { BackupModal } from './components/BackupModal';
 import { useMarkets } from './hooks/useMarkets';
 import { clearProfitHistory, connectBitgetAccount, deleteSavedBitgetLogin, disconnectBitgetAccount, hasSavedBitgetLogin, loadProfitHistory, loginBitgetAccount, mergeLiveContracts, refreshBitgetAccount, refreshBitgetContracts } from './services/accountBridge';
 import { connectRemoteHub, disconnectRemoteHub, loadSavedRemoteHub, refreshRemoteHub, type RemoteSyncEnvelope } from './services/remoteSync';
@@ -33,6 +34,7 @@ export default function App() {
   const [connectOpen, setConnectOpen] = useState(false);
   const [remoteOpen, setRemoteOpen] = useState(() => new URLSearchParams(window.location.search).get('sync') === '1');
   const [remoteConnected, setRemoteConnected] = useState(false);
+  const [backupOpen, setBackupOpen] = useState(false);
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
   const [passphrase, setPassphrase] = useState('');
@@ -229,6 +231,7 @@ export default function App() {
             ? <button className="api-connected" onClick={disconnectBitget}><ShieldCheck size={14}/> Bitget connected <LogOut size={13}/></button>
             : <button className="connect-api" onClick={() => { setUseSavedLogin(hasSavedLogin); setConnectOpen(true); }}><KeyRound size={14}/> {hasSavedLogin ? 'Unlock Bitget' : 'Connect Bitget'}</button>}
         <button className="sync-hub-button" onClick={() => setRemoteOpen(true)}><Radio size={14}/> Sync</button>
+        <button className="backup-button" onClick={() => setBackupOpen(true)}><ArchiveRestore size={14}/> Backup</button>
         <button className="icon-button"><Search size={18}/></button><button className="icon-button"><Bell size={18}/><i/></button>
         <button className="avatar">AG</button>
         <button className="menu-toggle" onClick={() => setMobileMenu(v => !v)}>{mobileMenu ? <X/> : <Command/>}</button>
@@ -372,7 +375,8 @@ export default function App() {
     </div>}
 
     {remoteOpen && <RemoteSyncModal onClose={() => setRemoteOpen(false)} onRemoteConnected={applyRemotePayload}/>}
+    {backupOpen && <BackupModal onClose={() => setBackupOpen(false)} onImported={loadHistory}/>}
 
-    <footer><span><CircleHelp size={14}/> Contract P&amp;L refreshes every 2s · desktop sync is read-only</span><span><Settings2 size={14}/> v0.3.1</span></footer>
+    <footer><span><CircleHelp size={14}/> Encrypted .tradingjournal import/export · no API credentials included</span><span><Settings2 size={14}/> v0.3.2</span></footer>
   </div>;
 }

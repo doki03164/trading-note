@@ -1,7 +1,7 @@
 {
   "name": "trading-journal",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -18,6 +18,8 @@
   },
   "dependencies": {
     "@capacitor/core": "^7.4.3",
+    "@capacitor/filesystem": "^7.1.8",
+    "@capacitor/share": "^7.0.4",
     "@supabase/supabase-js": "2.111.0",
     "@tauri-apps/api": "2.11.1",
     "lucide-react": "^0.468.0",

@@ -8,7 +8,7 @@ use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
     thread::JoinHandle,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -380,6 +380,15 @@ fn summarize_futures_balance(accounts: Vec<FuturesAccount>) -> Option<FuturesBal
 
 fn timestamp_ms() -> String {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis().to_string()
+}
+
+fn merge_imported_history(current: Vec<HistoryEntry>, imported: Vec<HistoryEntry>, replace: bool) -> Vec<HistoryEntry> {
+    let mut by_timestamp: BTreeMap<u128, HistoryEntry> = BTreeMap::new();
+    if !replace { current.into_iter().for_each(|entry| { by_timestamp.insert(entry.timestamp, entry); }); }
+    imported.into_iter().filter(|entry| entry.timestamp > 0).for_each(|entry| { by_timestamp.insert(entry.timestamp, entry); });
+    let mut values: Vec<HistoryEntry> = by_timestamp.into_values().collect();
+    if values.len() > 10_000 { values.drain(..values.len() - 10_000); }
+    values
 }
 
 fn json_text(value: Option<&Value>) -> String {
@@ -915,6 +924,14 @@ fn disconnect_bitget(state: tauri::State<'_, BitgetState>, shared: tauri::State<
 fn load_history(app: tauri::AppHandle) -> Result<Vec<HistoryEntry>, String> { read_history(&app) }
 
 #[tauri::command]
+fn import_profit_history(entries: Vec<HistoryEntry>, replace: bool, app: tauri::AppHandle) -> Result<Vec<HistoryEntry>, String> {
+    let values = merge_imported_history(read_history(&app).unwrap_or_default(), entries, replace);
+    let json = serde_json::to_string(&values).map_err(|error| error.to_string())?;
+    std::fs::write(history_path(&app)?, json).map_err(|error| error.to_string())?;
+    Ok(values)
+}
+
+#[tauri::command]
 fn clear_history(app: tauri::AppHandle) -> Result<(), String> {
     std::fs::write(history_path(&app)?, "[]").map_err(|e| e.to_string())
 }
@@ -925,7 +942,7 @@ pub fn run() {
         .manage(BitgetState::default())
         .manage(SharedPortfolio::default())
         .manage(SyncGatewayState::default())
-        .invoke_handler(tauri::generate_handler![connect_bitget, login_bitget, has_saved_login, delete_saved_login, refresh_bitget, refresh_bitget_contracts, disconnect_bitget, load_history, clear_history, start_sync_gateway, sync_gateway_status, stop_sync_gateway])
+        .invoke_handler(tauri::generate_handler![connect_bitget, login_bitget, has_saved_login, delete_saved_login, refresh_bitget, refresh_bitget_contracts, disconnect_bitget, load_history, import_profit_history, clear_history, start_sync_gateway, sync_gateway_status, stop_sync_gateway])
         .run(tauri::generate_context!())
         .expect("error while running Trading Journal");
 }
@@ -956,6 +973,17 @@ mod tests {
         assert_eq!(snapshot.positions[0].realized_pnl, Some(5.0));
         assert_eq!(snapshot.positions[0].daily_pnl, 2.0);
         assert_eq!(snapshot.futures_balance.unwrap().unrealized_pnl, -3.0);
+    }
+
+    #[test]
+    fn backup_history_import_merges_by_timestamp_or_replaces() {
+        let entry = |timestamp, pnl| HistoryEntry { timestamp, total_pnl: pnl, unrealized_pnl: pnl, realized_pnl: Some(0.0), portfolio_value: 10.0, positions: vec![] };
+        let merged = merge_imported_history(vec![entry(1, 1.0), entry(2, 2.0)], vec![entry(2, 20.0), entry(3, 3.0)], false);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[1].total_pnl, 20.0);
+        let replaced = merge_imported_history(merged, vec![entry(4, 4.0)], true);
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].timestamp, 4);
     }
 
     #[test]

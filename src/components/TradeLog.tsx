@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Plus, Search, Trash2 } from 'lucide-react';
 import type { JournalTrade, TradeSide } from '../types';
 import { deleteTrade, listPlaybooks, listTrades, saveTrade, tradePnl, tradeRMultiple } from '../services/journalData';
@@ -16,6 +16,12 @@ export function TradeLog() {
   const [tags, setTags] = useState(''); const [notes, setNotes] = useState('');
   const playbooks = listPlaybooks();
   const filtered = useMemo(() => trades.filter(trade => `${trade.symbol} ${trade.strategy} ${trade.tags.join(' ')}`.toLowerCase().includes(query.toLowerCase())), [trades, query]);
+
+  useEffect(() => {
+    const reload = () => setTrades(listTrades());
+    window.addEventListener('trading-journal:data-imported', reload);
+    return () => window.removeEventListener('trading-journal:data-imported', reload);
+  }, []);
 
   function submit(event: React.FormEvent) {
     event.preventDefault();

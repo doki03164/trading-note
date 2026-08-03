@@ -65,6 +65,18 @@ export async function deleteTradingNote(id: string): Promise<void> {
   }).finally(() => database.close());
 }
 
+export async function importTradingNotes(notes: TradingNote[], replace: boolean): Promise<void> {
+  const database = await openDatabase();
+  return new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    if (replace) store.clear();
+    notes.forEach(note => store.put(note));
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error('Trading notes failed to import'));
+  }).finally(() => database.close());
+}
+
 export function imageFileToDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();

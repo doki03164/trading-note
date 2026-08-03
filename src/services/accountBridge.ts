@@ -362,3 +362,11 @@ export async function hasSavedBitgetLogin() { return isTauriDesktop() ? invoke<b
 export async function deleteSavedBitgetLogin() { if (isTauriDesktop()) await invoke('delete_saved_login'); else localStorage.removeItem(VAULT_KEY); }
 export async function loadProfitHistory() { return isTauriDesktop() ? invoke<ProfitHistoryEntry[]>('load_history') : readMobileHistory(); }
 export async function clearProfitHistory() { if (isTauriDesktop()) await invoke('clear_history'); else localStorage.setItem(HISTORY_KEY, '[]'); }
+export async function importProfitHistory(entries: ProfitHistoryEntry[], replace: boolean) {
+  if (isTauriDesktop()) return invoke<ProfitHistoryEntry[]>('import_profit_history', { entries, replace });
+  const merged = replace ? entries : [...new Map([...readMobileHistory(), ...entries].map(entry => [entry.timestamp, entry])).values()];
+  merged.sort((a, b) => a.timestamp - b.timestamp);
+  const result = merged.slice(-10_000);
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(result));
+  return result;
+}

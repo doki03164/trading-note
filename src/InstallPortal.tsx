@@ -122,6 +122,6 @@ export function InstallPortal() {
       </ol>
     </section>
 
-    <footer className="install-footer"><span>Trading Journal v0.3.1</span><span>Web · Windows · macOS · iOS · Android</span></footer>
+    <footer className="install-footer"><span>Trading Journal v0.3.2</span><span>Web · Windows · macOS · iOS · Android</span></footer>
   </main>;
 }

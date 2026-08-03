@@ -31,7 +31,12 @@ export function TradingNotes() {
     catch (reason) { setError(String(reason)); }
   }
 
-  useEffect(() => { reload(); }, []);
+  useEffect(() => {
+    reload();
+    const imported = () => { reload(); setSelected(undefined); };
+    window.addEventListener('trading-journal:data-imported', imported);
+    return () => window.removeEventListener('trading-journal:data-imported', imported);
+  }, []);
 
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();

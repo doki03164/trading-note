@@ -27,3 +27,11 @@ export function savePlaybook(playbook: Playbook) { const values = listPlaybooks(
 export function deletePlaybook(id: string) { write(PLAYBOOKS_KEY, listPlaybooks().filter(item => item.id !== id)); }
 export function mergeCloudTrades(values: JournalTrade[]) { const merged = new Map(listTrades().map(item => [item.id, item])); values.forEach(item => merged.set(item.id, item)); write(TRADES_KEY, [...merged.values()]); }
 export function mergeCloudPlaybooks(values: Playbook[]) { const merged = new Map(listPlaybooks().map(item => [item.id, item])); values.forEach(item => merged.set(item.id, item)); write(PLAYBOOKS_KEY, [...merged.values()]); }
+export function importTrades(values: JournalTrade[], replace: boolean) {
+  if (replace) write(TRADES_KEY, values);
+  else mergeCloudTrades(values);
+}
+export function importPlaybooks(values: Playbook[], replace: boolean) {
+  if (replace) write(PLAYBOOKS_KEY, values);
+  else mergeCloudPlaybooks(values);
+}

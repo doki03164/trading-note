@@ -17,6 +17,7 @@ Cross-platform crypto trading journal for **Windows, macOS, iOS, and Android**. 
 - Performance reports for win rate, profit factor, expectancy, equity curve, and strategy results.
 - Strategy playbooks with rules and linked-trade performance.
 - Optional Supabase online database sync; GitHub stores source code only.
+- Password-encrypted `.tradingjournal` import/export archives for trades, playbooks, Trading Notes screenshots, and profit history.
 
 ## Data and security
 
@@ -26,6 +27,33 @@ Cross-platform crypto trading journal for **Windows, macOS, iOS, and Android**. 
 - Trading-note screenshots are stored locally in IndexedDB on the current device. They are not uploaded by this project.
 - Profit history is stored locally. Desktop uses the Tauri application-data directory; mobile uses the app WebView storage.
 - Desktop and mobile installations keep separate local vaults and histories.
+- `.tradingjournal` backups use PBKDF2-SHA-256 (310,000 iterations) and AES-256-GCM. API keys, API secrets, passphrases, login passwords, and cloud sessions are excluded.
+
+## Import and export a journal
+
+Select **Backup** in the application header to create or restore the dedicated Trading Journal archive format:
+
+```text
+Trading-Journal-2026-08-03-1200.tradingjournal
+```
+
+The export includes:
+
+- Trade Log records
+- Strategy Playbooks
+- Trading Notes and embedded chart screenshots
+- Saved profit/heatmap history
+
+Choose an export password of at least eight characters. The entire payload is authenticated and encrypted; the plaintext trades, notes, and screenshots do not appear in the file. Import validates the extension, file header, encryption parameters, password, schema, record counts, and image data before writing anything.
+
+Import modes:
+
+- **Merge:** retain current items and add/replace imported items with matching IDs or timestamps.
+- **Replace:** clear the current journal datasets and restore the backup contents.
+
+Windows and macOS packages register `.tradingjournal` as **Trading Journal Secure Backup**. Web/iOS/Android use the same Import file picker. Keep the password separately because it is intentionally not stored or recoverable by the application.
+
+On iOS and Android, Export writes the encrypted archive through the native Capacitor Filesystem plugin and opens the operating-system share sheet so the file can be saved to Files, Drive, or another storage provider. Web and desktop builds download the same format directly.
 
 ## Project structure
 
