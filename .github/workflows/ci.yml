@@ -78,10 +78,25 @@ jobs:
       - run: chmod +x android/gradlew
       - run: ./gradlew assembleDebug
         working-directory: android
+      - name: Validate Android package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="android/app/build/outputs/apk/debug/app-debug.apk"
+          AAPT=$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -1)
+          EXPECTED_VERSION=$(node -p "require('./package.json').version")
+          ACTUAL_VERSION=$($AAPT dump badging "$APK" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -1)
+          test "$ACTUAL_VERSION" = "$EXPECTED_VERSION"
+          {
+            echo "apk_zip_test=passed"
+            echo "app_version=$ACTUAL_VERSION"
+          } | tee android/app/build/outputs/apk/debug/android-verification.txt
       - uses: actions/upload-artifact@v4
         with:
           name: trading-journal-android-debug
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            android/app/build/outputs/apk/debug/android-verification.txt
 
   ios:
     runs-on: macos-latest
@@ -122,14 +137,20 @@ jobs:
           /usr/bin/unzip -t build/Trading-Journal-iOS-unsigned.ipa
 
           BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")
+          APP_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Info.plist")
+          EXPECTED_VERSION=$(node -p "require('../../package.json').version")
           EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")
           ARCHS=$(lipo -archs "$APP_PATH/$EXECUTABLE")
+          test "$APP_VERSION" = "$EXPECTED_VERSION"
+          test -f "$APP_PATH/PrivacyInfo.xcprivacy"
           {
             echo "simulator_build=passed"
             echo "device_bundle=$APP_PATH"
             echo "bundle_id=$BUNDLE_ID"
+            echo "app_version=$APP_VERSION"
             echo "device_architectures=$ARCHS"
             echo "ipa_zip_test=passed"
+            echo "privacy_manifest=passed"
           } | tee build/ios-verification.txt
       - name: Validate iOS profile
         shell: bash
