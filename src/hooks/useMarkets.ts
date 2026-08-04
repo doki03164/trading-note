@@ -8,6 +8,7 @@ export function useMarkets(exchange: Exchange) {
   const [live, setLive] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<Date>();
   const [error, setError] = useState('');
+  const [warning, setWarning] = useState('');
   const controller = useRef<AbortController | undefined>(undefined);
 
   const refresh = useCallback(async () => {
@@ -17,10 +18,10 @@ export function useMarkets(exchange: Exchange) {
     setError('');
     try {
       const result = await fetchMarkets(exchange, controller.current.signal);
-      setData(result.data); setLive(result.live); setUpdatedAt(new Date());
+      setData(result.data); setLive(result.live); setUpdatedAt(new Date()); setWarning(result.warning ?? '');
     } catch (error) {
       if (!(error instanceof DOMException && error.name === 'AbortError')) {
-        setData([]); setLive(false); setUpdatedAt(undefined);
+        setData([]); setLive(false); setUpdatedAt(undefined); setWarning('');
         setError(`Can't connect to ${exchange === 'binance' ? 'Binance' : 'Bitget'} API. ${error instanceof Error ? error.message : String(error)}`);
       }
     } finally { setLoading(false); }
@@ -32,5 +33,5 @@ export function useMarkets(exchange: Exchange) {
     return () => { window.clearInterval(timer); controller.current?.abort(); };
   }, [refresh]);
 
-  return { data, loading, live, updatedAt, error, refresh };
+  return { data, loading, live, updatedAt, error, warning, refresh };
 }

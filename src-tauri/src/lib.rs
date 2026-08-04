@@ -9,7 +9,7 @@ use serde_json::Value;
 use sha2::Sha256;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, OnceLock},
     thread::JoinHandle,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -204,6 +204,32 @@ struct FuturesBalanceSummary {
 struct PortfolioResponse {
     positions: Vec<PortfolioCoin>,
     futures_balance: Option<FuturesBalanceSummary>,
+    /// When the full account read was issued against Bitget, not when this struct was
+    /// serialized. Age shown in the UI has to be measured from the exchange read, otherwise a
+    /// slow or paused refresh still looks live.
+    #[serde(default)] captured_at: u128,
+    /// When the fast contract layer on top of `captured_at` was read.
+    #[serde(default)] contracts_captured_at: u128,
+    /// Set when the exchange answered only partially, so the caller can keep showing the last
+    /// good data instead of treating a degraded read as the truth.
+    #[serde(default)] stale_reason: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveContracts {
+    contracts: Vec<PortfolioCoin>,
+    captured_at: u128,
+    stale_reason: Option<String>,
+}
+
+/// Positions plus whether an empty list is trustworthy. Bitget serves the same account through
+/// a Classic and a Unified endpoint; when one is empty and the other errors we cannot tell a
+/// flat account from a half-failed read, and wiping the grid on that guess is what made
+/// positions blink out.
+struct PositionFetch {
+    positions: Vec<FuturesPosition>,
+    degraded: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -227,10 +253,16 @@ struct SyncGatewayStatus {
     tunnel_command: String,
 }
 
+/// Bumped when the sync payload shape changes; paired clients read it to spot an old desktop.
+const SYNC_VERSION: &str = "0.4.0";
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SyncEnvelope {
     version: &'static str,
+    /// When this response was serialized. Freshness lives on the snapshot's own capture
+    /// timestamps — a desktop that has not polled Bitget for ten minutes still answers
+    /// instantly, and clients must not read that as live data.
     generated_at: u128,
     snapshot: Option<PortfolioResponse>,
     history: Vec<HistoryEntry>,
@@ -258,7 +290,7 @@ fn gateway_status(runtime: &SyncGatewayRuntime) -> SyncGatewayStatus {
     }
 }
 
-fn merge_shared_contracts(snapshot: &mut PortfolioResponse, mut contracts: Vec<PortfolioCoin>) {
+fn merge_shared_contracts(snapshot: &mut PortfolioResponse, mut contracts: Vec<PortfolioCoin>, captured_at: u128) {
     let prior: HashMap<String, PortfolioCoin> = snapshot.positions.iter().filter(|item| item.side.is_some()).map(|item| (item.symbol.clone(), item.clone())).collect();
     for contract in &mut contracts {
         if let Some(previous) = prior.get(&contract.symbol) {
@@ -272,6 +304,25 @@ fn merge_shared_contracts(snapshot: &mut PortfolioResponse, mut contracts: Vec<P
     if let Some(balance) = &mut snapshot.futures_balance {
         balance.unrealized_pnl = snapshot.positions.iter().filter(|item| item.side.is_some()).map(|item| item.unrealized_pnl.unwrap_or_default()).sum();
     }
+    snapshot.contracts_captured_at = captured_at;
+}
+
+fn base_contract_symbol(symbol: &str) -> String {
+    let trimmed = symbol.strip_suffix("-LONG").or_else(|| symbol.strip_suffix("-SHORT")).unwrap_or(symbol);
+    canonical_futures_symbol(trimmed)
+}
+
+/// Last mark price we saw per contract, used so a position whose markPrice comes back blank is
+/// still valued at something sensible instead of disappearing.
+fn known_marks(snapshot: &PortfolioResponse) -> HashMap<String, f64> {
+    snapshot.positions.iter()
+        .filter(|item| item.side.is_some())
+        .filter_map(|item| item.mark_price.filter(|mark| *mark > 0.0).map(|mark| (base_contract_symbol(&item.symbol), mark)))
+        .collect()
+}
+
+fn open_contracts(snapshot: &PortfolioResponse) -> Vec<PortfolioCoin> {
+    snapshot.positions.iter().filter(|item| item.side.is_some()).cloned().collect()
 }
 
 fn history_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -421,12 +472,27 @@ fn signature(secret: &str, timestamp: &str, method: &str, path: &str, query: &st
     Ok(STANDARD.encode(mac.finalize().into_bytes()))
 }
 
+// One pooled client for every Bitget call. Building a fresh `Client` per request threw away
+// the connection pool, so the two-second refresh paid for a new TLS handshake each tick; the
+// timeouts stop a stalled socket from holding a poll open indefinitely.
+fn http() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(15))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .unwrap_or_else(|_| Client::new())
+    })
+}
+
 async fn get_assets(credentials: &BitgetCredentials) -> Result<Vec<Asset>, String> {
     let path = "/api/v2/spot/account/assets";
     let query = "assetType=hold_only";
     let timestamp = timestamp_ms();
     let sign = signature(&credentials.api_secret, &timestamp, "GET", path, query)?;
-    let response = Client::new().get(format!("https://api.bitget.com{path}?{query}"))
+    let response = http().get(format!("https://api.bitget.com{path}?{query}"))
         .header("ACCESS-KEY", &credentials.api_key)
         .header("ACCESS-SIGN", sign)
         .header("ACCESS-PASSPHRASE", &credentials.passphrase)
@@ -443,7 +509,7 @@ async fn get_assets(credentials: &BitgetCredentials) -> Result<Vec<Asset>, Strin
 }
 
 async fn get_tickers() -> Result<Vec<Ticker>, String> {
-    let payload = Client::new().get("https://api.bitget.com/api/v2/spot/market/tickers")
+    let payload = http().get("https://api.bitget.com/api/v2/spot/market/tickers")
         .send().await.map_err(|e| format!("Ticker connection failed: {e}"))?
         .json::<ApiResponse<Vec<Ticker>>>().await.map_err(|_| "Invalid ticker response".to_string())?;
     if payload.code != "00000" { return Err(payload.msg); }
@@ -454,7 +520,7 @@ async fn get_futures_query(credentials: &BitgetCredentials, query: &str) -> Resu
     let path = "/api/v2/mix/position/all-position";
     let timestamp = timestamp_ms();
     let sign = signature(&credentials.api_secret, &timestamp, "GET", path, query)?;
-    let response = Client::new().get(format!("https://api.bitget.com{path}?{query}"))
+    let response = http().get(format!("https://api.bitget.com{path}?{query}"))
         .header("ACCESS-KEY", &credentials.api_key)
         .header("ACCESS-SIGN", sign)
         .header("ACCESS-PASSPHRASE", &credentials.passphrase)
@@ -486,7 +552,7 @@ async fn get_uta_futures(credentials: &BitgetCredentials) -> Result<Vec<FuturesP
     let query = "category=USDT-FUTURES";
     let timestamp = timestamp_ms();
     let sign = signature(&credentials.api_secret, &timestamp, "GET", path, query)?;
-    let response = Client::new().get(format!("https://api.bitget.com{path}?{query}"))
+    let response = http().get(format!("https://api.bitget.com{path}?{query}"))
         .header("ACCESS-KEY", &credentials.api_key).header("ACCESS-SIGN", sign)
         .header("ACCESS-PASSPHRASE", &credentials.passphrase).header("ACCESS-TIMESTAMP", timestamp)
         .header("Content-Type", "application/json").header("locale", "en-US")
@@ -498,12 +564,18 @@ async fn get_uta_futures(credentials: &BitgetCredentials) -> Result<Vec<FuturesP
     Ok(data.list.into_iter().map(normalize_uta_position).collect())
 }
 
-async fn get_all_futures(credentials: &BitgetCredentials) -> Result<Vec<FuturesPosition>, String> {
+async fn get_all_futures(credentials: &BitgetCredentials) -> Result<PositionFetch, String> {
     match get_futures(credentials).await {
-        Ok(positions) if !positions.is_empty() => Ok(positions),
+        Ok(positions) if !positions.is_empty() => Ok(PositionFetch { positions, degraded: None }),
         classic => match get_uta_futures(credentials).await {
-            Ok(positions) => Ok(positions),
-            Err(uta_error) => match classic { Ok(empty) => Ok(empty), Err(classic_error) => Err(format!("Classic: {classic_error}; Unified: {uta_error}")) },
+            // Unified answered, so its list is authoritative whether or not it is empty.
+            Ok(positions) => Ok(PositionFetch { positions, degraded: None }),
+            Err(uta_error) => match classic {
+                // Classic returned nothing and Unified could not confirm it. Report the list,
+                // but flag that "no positions" here may be a false negative.
+                Ok(positions) => Ok(PositionFetch { positions, degraded: Some(format!("Unified position check failed: {uta_error}")) }),
+                Err(classic_error) => Err(format!("Classic: {classic_error}; Unified: {uta_error}")),
+            },
         },
     }
 }
@@ -512,7 +584,7 @@ async fn get_uta_account(credentials: &BitgetCredentials) -> Result<UtaAccountDa
     let path = "/api/v3/account/assets";
     let timestamp = timestamp_ms();
     let sign = signature(&credentials.api_secret, &timestamp, "GET", path, "")?;
-    let response = Client::new().get(format!("https://api.bitget.com{path}"))
+    let response = http().get(format!("https://api.bitget.com{path}"))
         .header("ACCESS-KEY", &credentials.api_key).header("ACCESS-SIGN", sign)
         .header("ACCESS-PASSPHRASE", &credentials.passphrase).header("ACCESS-TIMESTAMP", timestamp)
         .header("Content-Type", "application/json").header("locale", "en-US")
@@ -541,7 +613,7 @@ async fn get_futures_accounts(credentials: &BitgetCredentials) -> Result<Vec<Fut
     let query = "productType=USDT-FUTURES";
     let timestamp = timestamp_ms();
     let sign = signature(&credentials.api_secret, &timestamp, "GET", path, query)?;
-    let response = Client::new().get(format!("https://api.bitget.com{path}?{query}"))
+    let response = http().get(format!("https://api.bitget.com{path}?{query}"))
         .header("ACCESS-KEY", &credentials.api_key)
         .header("ACCESS-SIGN", sign)
         .header("ACCESS-PASSPHRASE", &credentials.passphrase)
@@ -558,7 +630,7 @@ async fn get_futures_accounts(credentials: &BitgetCredentials) -> Result<Vec<Fut
 }
 
 async fn get_futures_tickers() -> Result<Vec<FuturesTicker>, String> {
-    let payload = Client::new().get("https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES")
+    let payload = http().get("https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES")
         .send().await.map_err(|e| format!("Futures ticker connection failed: {e}"))?
         .json::<ApiResponse<Vec<FuturesTicker>>>().await.map_err(|_| "Invalid futures ticker response".to_string())?;
     if payload.code != "00000" { return Err(payload.msg); }
@@ -578,9 +650,15 @@ fn futures_net_pnl(unrealized_pnl: f64, realized_pnl: Option<f64>) -> f64 { unre
 
 fn futures_position_coin(position: &FuturesPosition, realized_pnl: Option<f64>, fallback_mark: f64) -> Option<PortfolioCoin> {
     let quantity = parse_number(&position.total);
-    let position_mark = parse_number(&position.mark_price);
-    let mark = if position_mark > 0.0 { position_mark } else { fallback_mark };
-    if quantity <= 0.0 || mark <= 0.0 { return None; }
+    // Only a closed-out position is worth dropping. Bitget intermittently returns a live
+    // position with a blank markPrice, and discarding those made open contracts vanish from
+    // the grid for one refresh even though the exchange still reported them.
+    if quantity <= 0.0 { return None; }
+    let entry_price = parse_number(&position.open_price_avg);
+    let mark = [parse_number(&position.mark_price), fallback_mark, entry_price]
+        .into_iter()
+        .find(|value| *value > 0.0)
+        .unwrap_or_default();
     let unrealized_pnl = parse_number(&position.unrealized_pl);
     let margin = parse_number(&position.margin_size);
     let side = if position.hold_side.eq_ignore_ascii_case("short") { "SHORT" } else { "LONG" };
@@ -601,7 +679,7 @@ fn futures_position_coin(position: &FuturesPosition, realized_pnl: Option<f64>, 
         change24h: roi,
         quote_volume: 0.0,
         high24h: mark,
-        low24h: parse_number(&position.open_price_avg),
+        low24h: entry_price,
         position_value: quantity * mark,
         daily_pnl: futures_net_pnl(unrealized_pnl, realized_pnl),
         unrealized_pnl: Some(unrealized_pnl),
@@ -610,8 +688,8 @@ fn futures_position_coin(position: &FuturesPosition, realized_pnl: Option<f64>, 
         side: Some(side.into()),
         quantity: Some(quantity),
         margin: Some(margin),
-        entry_price: Some(parse_number(&position.open_price_avg)),
-        mark_price: Some(mark),
+        entry_price: Some(entry_price),
+        mark_price: (mark > 0.0).then_some(mark),
         leverage: Some(parse_number(&position.leverage)),
         liquidation_price: (liquidation_price > 0.0).then_some(liquidation_price),
         margin_mode: (!position.margin_mode.is_empty()).then(|| position.margin_mode.to_uppercase()),
@@ -624,7 +702,7 @@ async fn get_signed_data<T: DeserializeOwned>(credentials: &BitgetCredentials, p
     let timestamp = timestamp_ms();
     let sign = signature(&credentials.api_secret, &timestamp, "GET", path, query)?;
     let url = if query.is_empty() { format!("https://api.bitget.com{path}") } else { format!("https://api.bitget.com{path}?{query}") };
-    let response = Client::new().get(url)
+    let response = http().get(url)
         .header("ACCESS-KEY", &credentials.api_key)
         .header("ACCESS-SIGN", sign)
         .header("ACCESS-PASSPHRASE", &credentials.passphrase)
@@ -685,13 +763,23 @@ async fn get_futures_bills(credentials: &BitgetCredentials) -> Result<Vec<Future
 }
 
 async fn portfolio(credentials: &BitgetCredentials) -> Result<PortfolioResponse, String> {
+    // Stamped before the requests go out, so the reported age is never younger than the data.
+    let captured_at = now_millis();
     let (tickers, futures_tickers) = tokio::try_join!(get_tickers(), get_futures_tickers())?;
     let (assets_result, futures_result, bills_result, accounts_result, uta_account_result) = tokio::join!(get_assets(credentials), get_all_futures(credentials), get_futures_bills(credentials), get_futures_accounts(credentials), get_uta_account(credentials));
     if assets_result.is_err() && futures_result.is_err() {
         return Err(format!("Spot: {}; Futures: {}", assets_result.err().unwrap_or_default(), futures_result.err().unwrap_or_default()));
     }
+    // A failed spot read used to drop every holding with no explanation; report it instead.
+    let spot_error = assets_result.as_ref().err().cloned();
     let assets = assets_result.unwrap_or_default();
-    let futures = futures_result.map_err(|error| format!("Bitget futures positions: {error}"))?;
+    let futures_fetch = futures_result.map_err(|error| format!("Bitget futures positions: {error}"))?;
+    let stale_reason = match (spot_error, futures_fetch.degraded) {
+        (Some(spot), Some(positions)) => Some(format!("Spot holdings unavailable: {spot}; {positions}")),
+        (Some(spot), None) => Some(format!("Spot holdings unavailable: {spot}")),
+        (None, degraded) => degraded,
+    };
+    let futures = futures_fetch.positions;
     let bills_available = bills_result.is_ok();
     let bills = bills_result.unwrap_or_default();
     let mut futures_balance = accounts_result.ok().and_then(summarize_futures_balance).or_else(|| uta_account_result.ok().map(summarize_uta_balance));
@@ -750,17 +838,23 @@ async fn portfolio(credentials: &BitgetCredentials) -> Result<PortfolioResponse,
         balance.realized_pnl = bills_available.then_some(realized_total);
     }
     result.sort_by(|a, b| b.position_value.total_cmp(&a.position_value));
-    Ok(PortfolioResponse { positions: result, futures_balance })
+    Ok(PortfolioResponse { positions: result, futures_balance, captured_at, contracts_captured_at: captured_at, stale_reason })
 }
 
-async fn live_contracts(credentials: &BitgetCredentials) -> Result<Vec<PortfolioCoin>, String> {
-    let futures = get_all_futures(credentials).await
+async fn live_contracts(credentials: &BitgetCredentials, fallback_marks: &HashMap<String, f64>) -> Result<LiveContracts, String> {
+    let captured_at = now_millis();
+    let fetch = get_all_futures(credentials).await
         .map_err(|error| format!("Bitget live futures positions: {error}"))?;
-    let mut contracts: Vec<PortfolioCoin> = futures.iter()
-        .filter_map(|position| futures_position_coin(position, None, 0.0))
+    let mut contracts: Vec<PortfolioCoin> = fetch.positions.iter()
+        .filter_map(|position| {
+            // The 30-second snapshot values a blank markPrice from the ticker feed; the
+            // two-second path has no ticker call, so it reuses the last mark we saw.
+            let fallback = fallback_marks.get(&canonical_futures_symbol(&position.symbol)).copied().unwrap_or_default();
+            futures_position_coin(position, None, fallback)
+        })
         .collect();
     contracts.sort_by(|a, b| b.position_value.total_cmp(&a.position_value));
-    Ok(contracts)
+    Ok(LiveContracts { contracts, captured_at, stale_reason: fetch.degraded })
 }
 
 fn respond_gateway_request(request: tiny_http::Request, token: &str, shared: &Arc<Mutex<Option<PortfolioResponse>>>, app: &tauri::AppHandle) {
@@ -782,7 +876,7 @@ fn respond_gateway_request(request: tiny_http::Request, token: &str, shared: &Ar
     }
 
     if method == Method::Get && path == "/health" {
-        let response = Response::from_string(r#"{"status":"ok","version":"0.3.1"}"#)
+        let response = Response::from_string(format!(r#"{{"status":"ok","version":"{SYNC_VERSION}"}}"#))
             .with_status_code(StatusCode(200)).with_header(cors).with_header(no_store).with_header(content_type);
         let _ = request.respond(response);
         return;
@@ -804,7 +898,7 @@ fn respond_gateway_request(request: tiny_http::Request, token: &str, shared: &Ar
 
     let snapshot = shared.lock().ok().and_then(|value| value.clone());
     let history = read_history(app).unwrap_or_default();
-    let envelope = SyncEnvelope { version: "0.3.1", generated_at: now_millis(), snapshot, history };
+    let envelope = SyncEnvelope { version: SYNC_VERSION, generated_at: now_millis(), snapshot, history };
     match serde_json::to_string(&envelope) {
         Ok(body) => {
             let response = Response::from_string(body).with_status_code(StatusCode(200)).with_header(cors).with_header(no_store).with_header(content_type);
@@ -904,13 +998,26 @@ async fn refresh_bitget(state: tauri::State<'_, BitgetState>, shared: tauri::Sta
 }
 
 #[tauri::command]
-async fn refresh_bitget_contracts(state: tauri::State<'_, BitgetState>, shared: tauri::State<'_, SharedPortfolio>) -> Result<Vec<PortfolioCoin>, String> {
+async fn refresh_bitget_contracts(state: tauri::State<'_, BitgetState>, shared: tauri::State<'_, SharedPortfolio>) -> Result<LiveContracts, String> {
     let credentials = state.0.lock().map_err(|_| "Credential state error".to_string())?.clone().ok_or("Bitget is not connected")?;
-    let contracts = live_contracts(&credentials).await?;
-    if let Some(snapshot) = shared.0.lock().map_err(|_| "Shared portfolio state error".to_string())?.as_mut() {
-        merge_shared_contracts(snapshot, contracts.clone());
+    let fallback_marks = {
+        let guard = shared.0.lock().map_err(|_| "Shared portfolio state error".to_string())?;
+        guard.as_ref().map(known_marks).unwrap_or_default()
+    };
+    let mut live = live_contracts(&credentials, &fallback_marks).await?;
+    let mut guard = shared.0.lock().map_err(|_| "Shared portfolio state error".to_string())?;
+    if let Some(snapshot) = guard.as_mut() {
+        if live.contracts.is_empty() && live.stale_reason.is_some() {
+            // Bitget could not confirm the account is flat, so keep the last known contracts
+            // rather than reporting a closed book the exchange never confirmed.
+            live.contracts = open_contracts(snapshot);
+            live.captured_at = snapshot.contracts_captured_at;
+        } else {
+            merge_shared_contracts(snapshot, live.contracts.clone(), live.captured_at);
+        }
+        snapshot.stale_reason = live.stale_reason.clone();
     }
-    Ok(contracts)
+    Ok(live)
 }
 
 #[tauri::command]
@@ -963,16 +1070,80 @@ mod tests {
         assert!(!sync_token_matches(None, "abc123"));
     }
 
+    fn snapshot_of(positions: Vec<PortfolioCoin>) -> PortfolioResponse {
+        PortfolioResponse { positions, futures_balance: Some(FuturesBalanceSummary::default()), captured_at: 1_000, contracts_captured_at: 1_000, stale_reason: None }
+    }
+
+    fn open_position(mark: &str) -> FuturesPosition {
+        FuturesPosition {
+            symbol: "BTCUSDT".into(), hold_side: "long".into(), margin_size: "80".into(), total: "0.01".into(),
+            unrealized_pl: "-7.25".into(), mark_price: mark.into(), open_price_avg: "64725".into(), ..FuturesPosition::default()
+        }
+    }
+
     #[test]
     fn live_contract_merge_preserves_realized_pnl() {
         let mut prior = coin(7.0, 100.0);
         prior.symbol = "BTCUSDT-LONG".into(); prior.side = Some("LONG".into()); prior.unrealized_pnl = Some(2.0); prior.realized_pnl = Some(5.0);
         let mut live = prior.clone(); live.unrealized_pnl = Some(-3.0); live.realized_pnl = None; live.daily_pnl = -3.0;
-        let mut snapshot = PortfolioResponse { positions: vec![prior], futures_balance: Some(FuturesBalanceSummary::default()) };
-        merge_shared_contracts(&mut snapshot, vec![live]);
+        let mut snapshot = snapshot_of(vec![prior]);
+        merge_shared_contracts(&mut snapshot, vec![live], 9_000);
         assert_eq!(snapshot.positions[0].realized_pnl, Some(5.0));
         assert_eq!(snapshot.positions[0].daily_pnl, 2.0);
+        assert_eq!(snapshot.contracts_captured_at, 9_000);
+        assert_eq!(snapshot.captured_at, 1_000, "the fast contract layer must not age up the full account snapshot");
         assert_eq!(snapshot.futures_balance.unwrap().unrealized_pnl, -3.0);
+    }
+
+    #[test]
+    fn open_position_survives_a_blank_mark_price() {
+        // Bitget intermittently blanks markPrice on a live position. Dropping it made the
+        // contract disappear from the grid for one refresh even though it was still open.
+        let from_ticker = futures_position_coin(&open_position(""), None, 64_000.0).expect("position kept via fallback mark");
+        assert_eq!(from_ticker.mark_price, Some(64_000.0));
+        assert_eq!(from_ticker.position_value, 640.0);
+        assert_eq!(from_ticker.unrealized_pnl, Some(-7.25));
+
+        // With no fallback either, the entry price still values the position.
+        let from_entry = futures_position_coin(&open_position(""), None, 0.0).expect("position kept via entry price");
+        assert_eq!(from_entry.mark_price, Some(64_725.0));
+
+        // A genuinely closed position is the only thing worth dropping.
+        let mut closed = open_position("64000");
+        closed.total = "0".into();
+        assert!(futures_position_coin(&closed, None, 64_000.0).is_none());
+    }
+
+    #[test]
+    fn position_without_any_price_reference_is_still_reported() {
+        let mut blank = open_position("");
+        blank.open_price_avg = String::new();
+        let coin = futures_position_coin(&blank, None, 0.0).expect("unpriced position is still an open position");
+        assert_eq!(coin.mark_price, None, "an unknown mark must read as unknown, not as zero");
+        assert_eq!(coin.position_value, 0.0);
+        assert_eq!(coin.unrealized_pnl, Some(-7.25), "exchange P&L is still authoritative");
+    }
+
+    #[test]
+    fn last_known_marks_carry_into_the_next_live_refresh() {
+        let mut long = coin(1.0, 100.0);
+        long.symbol = "BTCUSDT-LONG".into(); long.side = Some("LONG".into()); long.mark_price = Some(64_000.0);
+        let mut short = coin(1.0, 50.0);
+        short.symbol = "ETHUSDT-SHORT".into(); short.side = Some("SHORT".into()); short.mark_price = None;
+        let mut spot = coin(0.0, 10.0);
+        spot.symbol = "SOLUSDT".into(); spot.side = None; spot.mark_price = Some(150.0);
+
+        let marks = known_marks(&snapshot_of(vec![long, short, spot]));
+        assert_eq!(marks.get("BTCUSDT"), Some(&64_000.0));
+        assert_eq!(marks.get("ETHUSDT"), None, "an unknown mark is not worth carrying forward");
+        assert_eq!(marks.get("SOLUSDT"), None, "spot rows are not contracts");
+    }
+
+    #[test]
+    fn contract_symbols_drop_the_side_suffix() {
+        assert_eq!(base_contract_symbol("BTCUSDT-LONG"), "BTCUSDT");
+        assert_eq!(base_contract_symbol("ETHUSDTPERP-SHORT"), "ETHUSDT");
+        assert_eq!(base_contract_symbol("SOLUSDT"), "SOLUSDT");
     }
 
     #[test]

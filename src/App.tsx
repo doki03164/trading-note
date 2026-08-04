@@ -12,7 +12,9 @@ import { BackupModal } from './components/BackupModal';
 import { useMarkets } from './hooks/useMarkets';
 import { clearProfitHistory, connectBitgetAccount, deleteSavedBitgetLogin, disconnectBitgetAccount, hasSavedBitgetLogin, loadProfitHistory, loginBitgetAccount, mergeLiveContracts, refreshBitgetAccount, refreshBitgetContracts } from './services/accountBridge';
 import { connectRemoteHub, disconnectRemoteHub, loadSavedRemoteHub, refreshRemoteHub, type RemoteSyncEnvelope } from './services/remoteSync';
-import type { Exchange, FuturesBalance, MarketCoin, ProfitHistoryEntry, SizeMetric, TimeRange } from './types';
+import { ageSeconds, isNewerCapture, isStale, resolveCaptureTimes } from './services/freshness';
+import { instrumentName, isMetal } from './services/instruments';
+import type { Exchange, FuturesBalance, MarketCoin, PortfolioResponse, ProfitHistoryEntry, SizeMetric, TimeRange } from './types';
 import './styles.css';
 
 const ranges: TimeRange[] = ['1H', '4H', '1D', '1W'];
@@ -54,7 +56,19 @@ export default function App() {
   const [now, setNow] = useState(Date.now());
   const [history, setHistory] = useState<ProfitHistoryEntry[]>([]);
   const [historySnapshot, setHistorySnapshot] = useState<ProfitHistoryEntry>();
+  // Tracked per layer: the 2-second contract poll knows nothing about spot holdings, so it must
+  // not clear a partial-failure notice raised by the 30-second account read, or vice versa.
+  const [accountStaleReason, setAccountStaleReason] = useState('');
+  const [contractStaleReason, setContractStaleReason] = useState('');
+  // One flag per poller. Sharing a single flag let the slow 30-second account read starve the
+  // two-second contract refresh for its whole duration while the UI still claimed "2s live".
+  const contractRequestInFlight = useRef(false);
   const accountRequestInFlight = useRef(false);
+  // Newest exchange read applied to each layer. A slow response that resolves after a fresher
+  // one must not overwrite it, otherwise the P&L visibly jumps backwards.
+  const latestContractCaptureRef = useRef(0);
+  const latestAccountCaptureRef = useRef(0);
+  const apiDataRef = useRef<MarketCoin[]>([]);
   const market = useMarkets(exchange);
   const usingAccount = exchange === 'bitget' && (bitgetConnected || remoteConnected);
   const data = usingAccount ? apiData : market.data;
@@ -66,13 +80,48 @@ export default function App() {
     try { const items = await loadProfitHistory(); setHistory(items); setHistorySnapshot(current => current ?? items.at(-1)); } catch { setHistory([]); }
   }
 
+  function showPositions(positions: MarketCoin[]) {
+    apiDataRef.current = positions;
+    setApiData(positions);
+  }
+
+  /**
+   * Every full-snapshot write goes through here so the freshness clock reflects the exchange
+   * read behind the numbers rather than the moment the response happened to arrive.
+   */
+  function applySnapshot(snapshot: PortfolioResponse, fallbackCapturedAt = Date.now()) {
+    const { capturedAt, contractsCapturedAt } = resolveCaptureTimes(snapshot, fallbackCapturedAt);
+    if (!isNewerCapture(latestAccountCaptureRef.current, capturedAt)) return;
+    latestAccountCaptureRef.current = capturedAt;
+
+    if (!isNewerCapture(latestContractCaptureRef.current, contractsCapturedAt)) {
+      // The live layer already on screen is newer than this snapshot. Keep it on top of the
+      // freshly read spot rows and balance instead of rewinding the contract P&L.
+      showPositions(mergeLiveContracts(snapshot.positions, apiDataRef.current.filter(item => item.side)));
+    } else {
+      latestContractCaptureRef.current = contractsCapturedAt;
+      showPositions(snapshot.positions);
+    }
+    setFuturesBalance(snapshot.futuresBalance ?? undefined);
+    setApiUpdatedAt(new Date(latestContractCaptureRef.current));
+    setAccountUpdatedAt(new Date(capturedAt));
+    setAccountStaleReason(snapshot.staleReason ?? '');
+    setApiError(''); setAccountLive(true);
+  }
+
+  function resetFreshness() {
+    latestContractCaptureRef.current = 0;
+    latestAccountCaptureRef.current = 0;
+    setAccountStaleReason(''); setContractStaleReason('');
+  }
+
   function applyRemotePayload(payload: RemoteSyncEnvelope) {
     if (!payload.snapshot) return;
-    const confirmedAt = new Date(payload.generatedAt || Date.now());
-    setApiData(payload.snapshot.positions); setFuturesBalance(payload.snapshot.futuresBalance ?? undefined);
     setHistory(payload.history); setHistorySnapshot(current => current ?? payload.history.at(-1));
-    setRemoteConnected(true); setBitgetConnected(false); setExchange('bitget'); setAccountLive(true);
-    setApiUpdatedAt(confirmedAt); setAccountUpdatedAt(confirmedAt); setApiError('');
+    setRemoteConnected(true); setBitgetConnected(false); setExchange('bitget');
+    // The desktop answers instantly even when it has not reached Bitget for minutes, so age has
+    // to come from the snapshot's own capture time, never from when the envelope was built.
+    applySnapshot(payload.snapshot, payload.generatedAt || Date.now());
   }
 
   useEffect(() => { loadHistory(); hasSavedBitgetLogin().then(saved => { setHasSavedLogin(saved); setUseSavedLogin(saved); }).catch(() => {}); }, []);
@@ -99,19 +148,23 @@ export default function App() {
     if (!bitgetConnected) return;
     let stopped = false;
     const pollContracts = async () => {
-      if (accountRequestInFlight.current) return;
-      accountRequestInFlight.current = true;
+      if (contractRequestInFlight.current) return;
+      contractRequestInFlight.current = true;
       setLiveSyncing(true);
       try {
-        const contracts = await refreshBitgetContracts();
+        const live = await refreshBitgetContracts(apiDataRef.current);
         if (stopped) return;
-        setApiData(previous => mergeLiveContracts(previous, contracts));
-        setSelected(current => current?.side ? mergeLiveContracts([current], contracts).find(item => item.symbol === current.symbol) : current);
-        setFuturesBalance(previous => previous ? { ...previous, unrealizedPnl: contracts.reduce((sum, item) => sum + (item.unrealizedPnl ?? 0), 0) } : previous);
-        setApiUpdatedAt(new Date()); setApiError(''); setAccountLive(true);
+        setContractStaleReason(live.staleReason ?? '');
+        // A slower read that resolves out of order would otherwise rewind the grid.
+        if (!isNewerCapture(latestContractCaptureRef.current, live.capturedAt)) return;
+        latestContractCaptureRef.current = live.capturedAt;
+        showPositions(mergeLiveContracts(apiDataRef.current, live.contracts));
+        setSelected(current => current?.side ? mergeLiveContracts([current], live.contracts).find(item => item.symbol === current.symbol) ?? current : current);
+        setFuturesBalance(previous => previous ? { ...previous, unrealizedPnl: live.contracts.reduce((sum, item) => sum + (item.unrealizedPnl ?? 0), 0) } : previous);
+        setApiUpdatedAt(new Date(live.capturedAt)); setApiError(''); setAccountLive(true);
       } catch (error) {
         if (!stopped) { setApiError(String(error)); setAccountLive(false); }
-      } finally { accountRequestInFlight.current = false; if (!stopped) setLiveSyncing(false); }
+      } finally { contractRequestInFlight.current = false; if (!stopped) setLiveSyncing(false); }
     };
     const pollAccount = async () => {
       if (accountRequestInFlight.current) return;
@@ -119,8 +172,8 @@ export default function App() {
       try {
         const snapshot = await refreshBitgetAccount();
         if (stopped) return;
-        const confirmedAt = new Date();
-        setApiData(snapshot.positions); setFuturesBalance(snapshot.futuresBalance ?? undefined); setApiUpdatedAt(confirmedAt); setAccountUpdatedAt(confirmedAt); setApiError(''); setAccountLive(true); await loadHistory();
+        applySnapshot(snapshot);
+        await loadHistory();
       } catch (error) {
         if (!stopped) { setApiError(String(error)); setAccountLive(false); }
       } finally { accountRequestInFlight.current = false; }
@@ -135,8 +188,9 @@ export default function App() {
     try {
       const snapshot = await connectBitgetAccount({ apiKey, apiSecret, passphrase }, saveLogin, saveLogin ? loginPassword : null);
       disconnectRemoteHub(false); setRemoteConnected(false);
-      const confirmedAt = new Date();
-      setApiData(snapshot.positions); setFuturesBalance(snapshot.futuresBalance ?? undefined); setBitgetConnected(true); setAccountLive(true); setApiUpdatedAt(confirmedAt); setAccountUpdatedAt(confirmedAt); setExchange('bitget');
+      resetFreshness();
+      setBitgetConnected(true); setExchange('bitget');
+      applySnapshot(snapshot);
       await loadHistory();
       if (saveLogin) setHasSavedLogin(true);
       setApiKey(''); setApiSecret(''); setPassphrase(''); setLoginPassword(''); setConnectOpen(false);
@@ -149,8 +203,9 @@ export default function App() {
     try {
       const snapshot = await loginBitgetAccount(loginPassword);
       disconnectRemoteHub(false); setRemoteConnected(false);
-      const confirmedAt = new Date();
-      setApiData(snapshot.positions); setFuturesBalance(snapshot.futuresBalance ?? undefined); setBitgetConnected(true); setAccountLive(true); setApiUpdatedAt(confirmedAt); setAccountUpdatedAt(confirmedAt); setExchange('bitget');
+      resetFreshness();
+      setBitgetConnected(true); setExchange('bitget');
+      applySnapshot(snapshot);
       setLoginPassword(''); setConnectOpen(false); await loadHistory();
     } catch (error) { setApiError(String(error)); }
     finally { setApiLoading(false); }
@@ -172,17 +227,22 @@ export default function App() {
     if (accountRequestInFlight.current) return;
     accountRequestInFlight.current = true;
     setApiLoading(true); setApiError('');
-    try { const snapshot = await refreshBitgetAccount(); const confirmedAt = new Date(); setApiData(snapshot.positions); setFuturesBalance(snapshot.futuresBalance ?? undefined); setApiUpdatedAt(confirmedAt); setAccountUpdatedAt(confirmedAt); setAccountLive(true); await loadHistory(); }
+    try { applySnapshot(await refreshBitgetAccount()); await loadHistory(); }
     catch (error) { setApiError(String(error)); setAccountLive(false); }
     finally { accountRequestInFlight.current = false; setApiLoading(false); }
   }
 
+  function clearAccountView() {
+    resetFreshness(); setAccountLive(false); showPositions([]);
+    setFuturesBalance(undefined); setApiUpdatedAt(undefined); setAccountUpdatedAt(undefined); setExchange('binance');
+  }
+
   async function disconnectBitget() {
-    await disconnectBitgetAccount(); setBitgetConnected(false); setAccountLive(false); setApiData([]); setFuturesBalance(undefined); setApiUpdatedAt(undefined); setAccountUpdatedAt(undefined); setExchange('binance');
+    await disconnectBitgetAccount(); setBitgetConnected(false); clearAccountView();
   }
 
   function disconnectRemote() {
-    disconnectRemoteHub(false); setRemoteConnected(false); setAccountLive(false); setApiData([]); setFuturesBalance(undefined); setApiUpdatedAt(undefined); setAccountUpdatedAt(undefined); setExchange('binance');
+    disconnectRemoteHub(false); setRemoteConnected(false); clearAccountView();
   }
 
   async function clearHistory() {
@@ -208,7 +268,12 @@ export default function App() {
   const currentContracts = apiData.filter(item => item.side);
   const cryptoHoldings = apiData.filter(item => !item.side && !item.symbol.endsWith('-CLOSED'));
   const quantity = (item: MarketCoin) => item.quantity ?? (item.price > 0 ? item.positionValue / item.price : 0);
-  const liveAge = apiUpdatedAt ? Math.max(0, Math.floor((now - apiUpdatedAt.getTime()) / 1_000)) : null;
+  const liveAge = ageSeconds(apiUpdatedAt?.getTime(), now);
+  // Age is measured from the exchange read, so this catches a throttled tab or a paired desktop
+  // that stopped polling — cases where the old UI kept saying "live" over frozen numbers.
+  const stale = usingAccount && isStale(apiUpdatedAt?.getTime(), now);
+  const confirmedLive = live && !stale;
+  const staleReason = [accountStaleReason, contractStaleReason].filter(Boolean).join(' · ');
   const marginUsed = currentContracts.reduce((sum, item) => sum + (item.margin ?? 0), 0);
   const profitableContracts = currentContracts.filter(item => (item.unrealizedPnl ?? 0) >= 0).length;
 
@@ -241,12 +306,14 @@ export default function App() {
     <main>
       <section className="page-heading">
         <div><div className="eyebrow"><span/> TRADING PERFORMANCE INTELLIGENCE</div><h1>{{heatmap:'Daily Profit Heatmap',trades:'Trade Log',reports:'Performance Reports',history:'Profit History',notes:'Trading Notes',playbooks:'Strategy Playbooks',cloud:'Cloud Database'}[view]}</h1><p>{{heatmap:'See exactly where today’s portfolio profit and loss comes from.',trades:'Log executions, fees, risk and setup context in one searchable database.',reports:'Measure win rate, expectancy, profit factor and strategy performance.',history:'Review locally saved Bitget P&L snapshots over time.',notes:'Upload chart screenshots and review your past trading decisions.',playbooks:'Define repeatable setups and review their actual results.',cloud:'Synchronize your private journal across every installed device.'}[view]}</p></div>
-        <div className={`connection ${live ? '' : 'offline'} ${liveSyncing ? 'syncing' : ''}`}>{usingAccount ? <Radio size={14}/> : live ? <Wifi size={14}/> : <WifiOff size={14}/>}<span>{remoteConnected ? live ? 'PC / Mac sync · 2s live' : 'Desktop sync paused' : usingAccount ? live ? 'Contract P&L · 2s live' : 'Contract refresh paused' : live ? `Live ${exchange} market data` : "Can't connect to API"}</span><small>{usingAccount && liveAge != null ? `${liveAge}s ago` : updatedAt?.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</small></div>
+        <div className={`connection ${confirmedLive ? '' : 'offline'} ${liveSyncing ? 'syncing' : ''}`}>{usingAccount ? <Radio size={14}/> : live ? <Wifi size={14}/> : <WifiOff size={14}/>}<span>{remoteConnected ? confirmedLive ? 'PC / Mac sync · 2s live' : stale ? 'Desktop sync stalled' : 'Desktop sync paused' : usingAccount ? confirmedLive ? 'Contract P&L · 2s live' : stale ? 'Contract data stalled' : 'Contract refresh paused' : live ? `Live ${exchange} market data` : "Can't connect to API"}</span><small>{usingAccount && liveAge != null ? `${liveAge}s ago` : updatedAt?.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</small></div>
       </section>
 
       {view === 'heatmap' ? <>
       {!usingAccount && market.error && <div className="market-api-error"><WifiOff size={18}/><div><strong>Can't connect to API</strong><span>{market.error}</span></div><button onClick={market.refresh}>Retry</button></div>}
+      {!usingAccount && !market.error && market.warning && <div className="market-api-error"><WifiOff size={18}/><div><strong>Partial market data</strong><span>{market.warning}</span></div><button onClick={market.refresh}>Retry</button></div>}
       {usingAccount && apiError && <div className="market-api-error"><WifiOff size={18}/><div><strong>{remoteConnected ? 'Desktop sync paused' : 'Bitget live refresh paused'}</strong><span>{apiError} · showing data confirmed at {apiUpdatedAt?.toLocaleTimeString()}</span></div><button onClick={refresh}>Retry</button></div>}
+      {usingAccount && !apiError && staleReason && <div className="market-api-error"><WifiOff size={18}/><div><strong>Bitget answered only partially</strong><span>{staleReason} · the last confirmed values are still shown</span></div><button onClick={refresh}>Retry</button></div>}
       <section className={`stat-row ${usingAccount ? 'account-stats' : ''}`}>
         {usingAccount ? <>
           <article><div><span>UNREALIZED P&amp;L</span><strong className={stats.unrealized >= 0 ? 'profit-text' : 'loss-text'}>{fmtPnl(stats.unrealized)}</strong><em className="muted">Direct from open Bitget positions</em></div><div className="mini-chart"><Sparkline positive={stats.unrealized >= 0}/></div></article>
@@ -263,9 +330,9 @@ export default function App() {
       {usingAccount && <section className="live-trading-dashboard">
         <div className={`live-pnl-hero ${stats.unrealized >= 0 ? 'is-profit' : 'is-loss'}`}>
           <div className="live-pnl-primary">
-            <div className="live-kicker"><Radio size={15}/><span>OPEN CONTRACT P&amp;L</span><b>LIVE</b></div>
+            <div className="live-kicker"><Radio size={15}/><span>OPEN CONTRACT P&amp;L</span><b>{confirmedLive ? 'LIVE' : 'STALE'}</b></div>
             <strong>{fmtPnl(stats.unrealized)}</strong>
-            <p>Exchange unrealized P&amp;L · refreshed every 2 seconds</p>
+            <p>{confirmedLive ? 'Exchange unrealized P&L · refreshed every 2 seconds' : `Last confirmed by the exchange ${liveAge == null ? 'never' : `${liveAge}s ago`} · not updating`}</p>
           </div>
           <div className="live-overview-metrics">
             <article><span>OPEN POSITIONS</span><strong>{currentContracts.length}</strong><small>USDT perpetuals</small></article>
@@ -291,7 +358,7 @@ export default function App() {
             <div className="inventory-title"><div><span>LIVE CONTRACTS</span><strong>Open USDT futures positions</strong></div><em>{currentContracts.length}</em></div>
             {currentContracts.length ? <div className="contract-live-grid">
               {currentContracts.map(item => { const pnl = item.unrealizedPnl ?? 0; const roi = item.roi ?? item.change24h; const contract = item.symbol.replace(/-(LONG|SHORT)$/, ''); return <button className={`contract-live-card ${pnl >= 0 ? 'is-profit' : 'is-loss'}`} key={item.symbol} onClick={() => setSelected(item)}>
-                <div className="contract-card-top"><div><i/><span>{contract}</span><small>{item.marginMode || 'FUTURES'} {item.leverage ? `· ${item.leverage}×` : ''}</small></div><b className={item.side === 'LONG' ? 'long-side' : 'short-side'}>{item.side === 'LONG' ? <ArrowUpRight size={13}/> : <ArrowDownRight size={13}/>} {item.side}</b></div>
+                <div className="contract-card-top"><div><i/><span>{contract}</span><small>{isMetal(item.symbol) ? `${instrumentName(item.symbol)} · ` : ''}{item.marginMode || 'FUTURES'} {item.leverage ? `· ${item.leverage}×` : ''}</small></div><b className={item.side === 'LONG' ? 'long-side' : 'short-side'}>{item.side === 'LONG' ? <ArrowUpRight size={13}/> : <ArrowDownRight size={13}/>} {item.side}</b></div>
                 <div className="contract-live-profit"><span>LIVE UNREALIZED</span><strong>{fmtPnl(pnl)}</strong><em className={roi >= 0 ? 'positive' : 'negative'}>{roi >= 0 ? '+' : '−'}{Math.abs(roi).toFixed(2)}% ROI</em></div>
                 <div className="contract-metrics"><div><span>Mark price</span><strong>{fmtPrice(item.markPrice ?? item.price)}</strong></div><div><span>Entry price</span><strong>{fmtPrice(item.entryPrice)}</strong></div><div><span>Position size</span><strong>{quantity(item).toLocaleString(undefined, { maximumFractionDigits: 6 })}</strong></div><div><span>Margin</span><strong>{item.margin?.toLocaleString(undefined, { maximumFractionDigits: 2 }) ?? '—'} USDT</strong></div></div>
                 <div className="contract-card-footer"><span><Radio size={11}/> {liveAge == null ? 'Connecting' : `Updated ${liveAge}s ago`}</span><span>Liq. {fmtPrice(item.liquidationPrice ?? undefined)}</span></div>
@@ -343,7 +410,7 @@ export default function App() {
 
     {selected && <aside className="detail-panel">
       <button className="close" onClick={() => setSelected(undefined)}><X size={18}/></button>
-      <span className="panel-label">{selected.exchange.toUpperCase()} · {selected.side ? 'LIVE FUTURES' : 'SPOT'}</span><h2>{selected.side ? selected.symbol.replace(/-(LONG|SHORT)$/, '') : selected.base}<small>{selected.side ? ` · ${selected.side}` : '/USDT'}</small></h2>
+      <span className="panel-label">{selected.exchange.toUpperCase()} · {isMetal(selected.symbol) ? 'COMMODITY' : selected.side ? 'LIVE FUTURES' : 'SPOT'}</span><h2>{selected.side ? selected.symbol.replace(/-(LONG|SHORT)$/, '') : selected.base}<small>{isMetal(selected.symbol) ? ` · ${instrumentName(selected.symbol)}` : ''}{selected.side ? ` · ${selected.side}` : isMetal(selected.symbol) ? '' : '/USDT'}</small></h2>
       <strong>{selected.side ? fmtPnl(selected.unrealizedPnl ?? 0) : selected.pnlSource === 'exchange' ? fmtPnl(selected.dailyPnl) : `${selected.change24h >= 0 ? '+' : ''}${selected.change24h.toFixed(2)}%`}</strong>
       <em className={selected.side ? (selected.unrealizedPnl ?? 0) >= 0 ? 'positive' : 'negative' : selected.pnlSource === 'exchange' ? selected.dailyPnl >= 0 ? 'positive' : 'negative' : selected.change24h >= 0 ? 'positive' : 'negative'}>{selected.side ? `Live exchange unrealized · ${(selected.roi ?? selected.change24h).toFixed(2)}% ROI` : selected.pnlSource === 'exchange' ? 'Actual exchange net P&L' : 'Live 24h market change · P&L N/A'}</em>
       <div className="panel-chart"><Sparkline positive={selected.side ? (selected.unrealizedPnl ?? 0) >= 0 : selected.dailyPnl >= 0}/></div>

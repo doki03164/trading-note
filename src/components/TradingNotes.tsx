@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { CalendarDays, Camera, Clock3, FileImage, Plus, Save, Search, Trash2, X } from 'lucide-react';
 import type { TradeDirection, TradeMarket, TradingNote } from '../types';
 import { createTradingNote, deleteTradingNote, imageFileToDataUrl, loadTradingNotes, saveTradingNote } from '../services/tradingNotes';
+import { METAL_SYMBOLS, instrumentName, isMetal } from '../services/instruments';
 
 function localDateTime() {
   const now = new Date();
@@ -105,7 +106,7 @@ export function TradingNotes() {
         {selected ? <>
           <div className="review-heading"><div><span>PAST TRADING NOTE</span><h2>{selected.title}</h2></div><button onClick={() => setSelected(undefined)}><X size={16}/></button></div>
           <img className="review-chart" src={selected.screenshot} alt={`${selected.symbol} saved chart screenshot`}/>
-          <div className="review-tags"><span className={`direction ${selected.direction.toLowerCase()}`}>{selected.direction}</span><span>{selected.market}</span><strong>{selected.symbol || 'GENERAL'}</strong></div>
+          <div className="review-tags"><span className={`direction ${selected.direction.toLowerCase()}`}>{selected.direction}</span><span>{selected.market}</span><strong>{selected.symbol ? isMetal(selected.symbol) ? `${selected.symbol} · ${instrumentName(selected.symbol)}` : selected.symbol : 'GENERAL'}</strong></div>
           <dl className="review-details"><div><dt><CalendarDays size={12}/> Trade date</dt><dd>{new Date(selected.tradeDate).toLocaleString()}</dd></div><div><dt>Setup</dt><dd>{selected.setup || '—'}</dd></div></dl>
           <div className="review-notes"><span>REVIEW NOTES</span><p>{selected.notes || 'No written review for this chart.'}</p></div>
         </> : <div className="review-placeholder"><Camera size={30}/><h3>Select a trading note</h3><p>Open a past screenshot and review your trade plan.</p></div>}
@@ -123,8 +124,8 @@ export function TradingNotes() {
           </div>
           <div className="note-fields">
             <label>Note title<input value={title} onChange={event => setTitle(event.target.value)} placeholder="e.g. BTC breakout review" required/></label>
-            <div className="field-pair"><label>Symbol<input value={symbol} onChange={event => setSymbol(event.target.value)} placeholder="BTCUSDT"/></label><label>Trade date<input type="datetime-local" value={tradeDate} onChange={event => setTradeDate(event.target.value)} required/></label></div>
-            <div className="field-pair"><label>Market<select value={market} onChange={event => setMarket(event.target.value as TradeMarket)}><option>USDT Futures</option><option>Spot</option></select></label><label>Direction<select value={direction} onChange={event => setDirection(event.target.value as TradeDirection)}><option>LONG</option><option>SHORT</option><option>OBSERVATION</option></select></label></div>
+            <div className="field-pair"><label>Symbol<input list="instrument-list" value={symbol} onChange={event => setSymbol(event.target.value)} placeholder="BTCUSDT or XAUUSDT"/><datalist id="instrument-list">{METAL_SYMBOLS.map(value => <option key={value} value={value}>{instrumentName(value)}</option>)}</datalist></label><label>Trade date<input type="datetime-local" value={tradeDate} onChange={event => setTradeDate(event.target.value)} required/></label></div>
+            <div className="field-pair"><label>Market<select value={market} onChange={event => setMarket(event.target.value as TradeMarket)}><option>USDT Futures</option><option>Spot</option><option>Commodities</option></select></label><label>Direction<select value={direction} onChange={event => setDirection(event.target.value as TradeDirection)}><option>LONG</option><option>SHORT</option><option>OBSERVATION</option></select></label></div>
             <label>Setup / strategy<input value={setup} onChange={event => setSetup(event.target.value)} placeholder="Breakout, pullback, reversal…"/></label>
             <label>Review notes<textarea value={body} onChange={event => setBody(event.target.value)} placeholder="Why did you enter? What worked? What should change next time?" rows={5}/></label>
           </div>

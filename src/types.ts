@@ -40,6 +40,18 @@ export interface FuturesBalance {
 export interface PortfolioResponse {
   positions: MarketCoin[];
   futuresBalance?: FuturesBalance | null;
+  /** When the full account read was issued against the exchange, not when it was rendered. */
+  capturedAt?: number;
+  /** When the fast contract layer sitting on top of that snapshot was read. */
+  contractsCapturedAt?: number;
+  /** Set when the exchange answered only partially, so the UI can say so instead of guessing. */
+  staleReason?: string | null;
+}
+
+export interface LiveContracts {
+  contracts: MarketCoin[];
+  capturedAt: number;
+  staleReason?: string | null;
 }
 
 export interface ProfitHistoryEntry {
@@ -55,7 +67,8 @@ export type TimeRange = '1H' | '4H' | '1D' | '1W';
 export type SizeMetric = 'position' | 'profit';
 
 export type TradeDirection = 'LONG' | 'SHORT' | 'OBSERVATION';
-export type TradeMarket = 'USDT Futures' | 'Spot';
+/** Commodities cover the precious-metal perpetuals (XAUUSDT, XPDUSDT and friends). */
+export type TradeMarket = 'USDT Futures' | 'Spot' | 'Commodities';
 
 export interface TradingNote {
   id: string;

@@ -1,6 +1,6 @@
 import { CapacitorHttp } from '@capacitor/core';
 import { invoke } from '@tauri-apps/api/core';
-import type { FuturesBalance, MarketCoin, PortfolioResponse, ProfitHistoryEntry } from '../types';
+import type { FuturesBalance, LiveContracts, MarketCoin, PortfolioResponse, ProfitHistoryEntry } from '../types';
 
 interface Credentials { apiKey: string; apiSecret: string; passphrase: string }
 interface ApiEnvelope<T> { code: string | number; msg?: string; message?: string; data?: T | null }
@@ -120,8 +120,12 @@ export function normalizeUtaPosition(position: UtaFuturesPosition): FuturesPosit
 
 export function futuresPositionToMarketCoin(position: FuturesPosition, realizedPnl?: number, fallbackMark = 0): MarketCoin | null {
   const quantity = number(position.total), margin = number(position.marginSize);
-  const markPrice = number(position.markPrice) || fallbackMark;
-  if (quantity <= 0 || markPrice <= 0) return null;
+  // Only a closed-out position is worth dropping. Bitget intermittently returns a live position
+  // with a blank markPrice, and discarding those made open contracts vanish from the grid for
+  // one refresh even though the exchange still reported them.
+  if (quantity <= 0) return null;
+  const entryPrice = number(position.openPriceAvg);
+  const markPrice = [number(position.markPrice), fallbackMark, entryPrice].find(value => value > 0) ?? 0;
   const symbol = canonicalFuturesSymbol(position.symbol);
   const side = position.holdSide.trim().toUpperCase() === 'SHORT' ? 'SHORT' : 'LONG';
   const unrealizedPnl = number(position.unrealizedPL);
@@ -138,7 +142,7 @@ export function futuresPositionToMarketCoin(position: FuturesPosition, realizedP
     change24h: roi,
     quoteVolume: 0,
     high24h: markPrice,
-    low24h: number(position.openPriceAvg),
+    low24h: entryPrice,
     positionValue: quantity * markPrice,
     dailyPnl: actualFuturesPnl(unrealizedPnl, realizedPnl),
     unrealizedPnl,
@@ -147,8 +151,8 @@ export function futuresPositionToMarketCoin(position: FuturesPosition, realizedP
     side,
     quantity,
     margin,
-    entryPrice: number(position.openPriceAvg),
-    markPrice,
+    entryPrice,
+    markPrice: markPrice > 0 ? markPrice : undefined,
     leverage: number(position.leverage),
     liquidationPrice: liquidation > 0 ? liquidation : null,
     marginMode: position.marginMode?.toUpperCase() || undefined,
@@ -172,27 +176,52 @@ export function classicPositionList(data: FuturesPosition[] | { list?: FuturesPo
   return Array.isArray(data) ? data : data.list ?? [];
 }
 
-async function mobileFuturesPositions(credentials: Credentials) {
+/**
+ * Positions plus whether an empty list is trustworthy. Bitget serves the same account through a
+ * Classic and a Unified endpoint; when one is empty and the other errors we cannot tell a flat
+ * account from a half-failed read, and wiping the grid on that guess is what made positions
+ * blink out.
+ */
+export interface PositionFetch { positions: FuturesPosition[]; degraded?: string }
+
+async function mobileFuturesPositions(credentials: Credentials): Promise<PositionFetch> {
   let filtered: FuturesPosition[] | undefined, filteredError = '';
   try {
     filtered = classicPositionList(await request<FuturesPosition[] | { list?: FuturesPosition[] }>('/api/v2/mix/position/all-position', 'productType=USDT-FUTURES&marginCoin=USDT', credentials));
-    if (filtered.length) return filtered;
+    if (filtered.length) return { positions: filtered };
   } catch (error) { filteredError = error instanceof Error ? error.message : String(error); }
 
   let unfiltered: FuturesPosition[] | undefined, unfilteredError = '';
   try {
     unfiltered = classicPositionList(await request<FuturesPosition[] | { list?: FuturesPosition[] }>('/api/v2/mix/position/all-position', 'productType=USDT-FUTURES', credentials));
-    if (unfiltered.length) return unfiltered;
+    if (unfiltered.length) return { positions: unfiltered };
   } catch (error) { unfilteredError = error instanceof Error ? error.message : String(error); }
 
   let utaError = '';
   try {
+    // Unified answered, so its list is authoritative whether or not it is empty.
     const unified = await request<UtaPositionData>('/api/v3/position/current-position', 'category=USDT-FUTURES', credentials);
-    return unified.list.map(normalizeUtaPosition);
+    return { positions: unified.list.map(normalizeUtaPosition) };
   } catch (error) { utaError = error instanceof Error ? error.message : String(error); }
-  if (unfiltered) return unfiltered;
-  if (filtered) return filtered;
+  // Classic returned nothing and Unified could not confirm it, so "no positions" here may be a
+  // false negative rather than a flat account.
+  const degraded = `Unified position check failed: ${utaError}`;
+  if (unfiltered) return { positions: unfiltered, degraded };
+  if (filtered) return { positions: filtered, degraded };
   throw new Error(`Classic USDT: ${filteredError}; Classic all margins: ${unfilteredError}; Unified: ${utaError}`);
+}
+
+/**
+ * Last mark price we saw per contract, used so a position whose markPrice comes back blank is
+ * still valued at something sensible instead of disappearing.
+ */
+export function knownMarks(positions: MarketCoin[]) {
+  const marks = new Map<string, number>();
+  for (const item of positions) {
+    if (!item.side || !item.markPrice || item.markPrice <= 0) continue;
+    marks.set(canonicalFuturesSymbol(item.symbol.replace(/-(LONG|SHORT)$/, '')), item.markPrice);
+  }
+  return marks;
 }
 
 async function classicFuturesBills(credentials: Credentials, dayStart: number, now: number) {
@@ -236,16 +265,22 @@ async function mobileFuturesBills(credentials: Credentials, dayStart: number, no
 }
 
 async function mobilePortfolio(credentials: Credentials): Promise<PortfolioResponse> {
-  const now = Date.now(), dayStart = now - now % 86_400_000;
-  const [tickers, futuresTickers, classicAssets, futuresResult, billsResult, classicAccounts, utaAccount] = await Promise.all([
+  // Stamped before the requests go out, so the reported age is never younger than the data.
+  const capturedAt = Date.now();
+  const now = capturedAt, dayStart = now - now % 86_400_000;
+  let spotError = '';
+  const [tickers, futuresTickers, classicAssets, futuresFetch, billsResult, classicAccounts, utaAccount] = await Promise.all([
     request<SpotTicker[]>('/api/v2/spot/market/tickers'),
     request<FuturesTicker[]>('/api/v2/mix/market/tickers', 'productType=USDT-FUTURES'),
-    request<SpotAsset[]>('/api/v2/spot/account/assets', 'assetType=hold_only', credentials).catch(() => []),
+    // A failed spot read used to drop every holding with no explanation; report it instead.
+    request<SpotAsset[]>('/api/v2/spot/account/assets', 'assetType=hold_only', credentials).catch(error => { spotError = error instanceof Error ? error.message : String(error); return [] as SpotAsset[]; }),
     mobileFuturesPositions(credentials),
     mobileFuturesBills(credentials, dayStart, now).then(value => ({ value, available: true })).catch(() => ({ value: [] as FuturesBill[], available: false })),
     request<FuturesAccount[]>('/api/v2/mix/account/accounts', 'productType=USDT-FUTURES', credentials).catch(() => []),
     request<UtaAccountData>('/api/v3/account/assets', '', credentials).catch(() => undefined),
   ]);
+  const futuresResult = futuresFetch.positions;
+  const staleReason = [spotError && `Spot holdings unavailable: ${spotError}`, futuresFetch.degraded].filter(Boolean).join('; ') || null;
   const assetsResult: SpotAsset[] = classicAssets.length ? classicAssets : (utaAccount?.assets ?? []).map(asset => ({ coin: asset.coin, available: asset.available, frozen: '0', locked: asset.locked }));
   if (!assetsResult.length && !futuresResult.length && !classicAccounts.length && !utaAccount) throw new Error('No Bitget holdings returned. Check API read permissions.');
 
@@ -296,7 +331,7 @@ async function mobilePortfolio(credentials: Credentials): Promise<PortfolioRespo
   const futuresBalance: FuturesBalance | undefined = account
     ? { marginCoin: account.marginCoin, available: number(account.available), locked: number(account.locked), accountEquity: number(account.accountEquity), unrealizedPnl: futuresResult.length ? positionUnrealized : futuresAccountUnrealized(account), realizedPnl: billsResult.available ? realizedTotal : null, maxTransferOut: number(account.maxTransferOut) }
     : utaAccount ? { marginCoin: 'USDT', available: number(utaUsdt?.available), locked: number(utaUsdt?.locked), accountEquity: number(utaAccount.usdtEquity || utaAccount.accountEquity), unrealizedPnl: futuresResult.length ? positionUnrealized : number(utaAccount.usdtUnrealisedPnl || utaAccount.unrealisedPnl), realizedPnl: billsResult.available ? realizedTotal : null, maxTransferOut: number(utaUsdt?.available) } : undefined;
-  return { positions, futuresBalance };
+  return { positions, futuresBalance, capturedAt, contractsCapturedAt: capturedAt, staleReason };
 }
 
 function readMobileHistory(): ProfitHistoryEntry[] {
@@ -351,11 +386,26 @@ export async function refreshBitgetAccount() {
   if (!mobileCredentials) throw new Error('Bitget is not connected');
   const snapshot = await mobilePortfolio(mobileCredentials); saveMobileSnapshot(snapshot); return snapshot;
 }
-export async function refreshBitgetContracts() {
-  if (isTauriDesktop()) return invoke<MarketCoin[]>('refresh_bitget_contracts');
+export async function refreshBitgetContracts(previous: MarketCoin[] = []): Promise<LiveContracts> {
+  if (isTauriDesktop()) return invoke<LiveContracts>('refresh_bitget_contracts');
   if (!mobileCredentials) throw new Error('Bitget is not connected');
-  const positions = await mobileFuturesPositions(mobileCredentials);
-  return positions.map(position => futuresPositionToMarketCoin(position)).filter((item): item is MarketCoin => item != null);
+  const capturedAt = Date.now();
+  const fetched = await mobileFuturesPositions(mobileCredentials);
+  // The full snapshot values a blank markPrice from the ticker feed; this fast path has no
+  // ticker call, so it reuses the last mark we saw.
+  const marks = knownMarks(previous);
+  const contracts = fetched.positions
+    .map(position => futuresPositionToMarketCoin(position, undefined, marks.get(canonicalFuturesSymbol(position.symbol)) ?? 0))
+    .filter((item): item is MarketCoin => item != null);
+  // Bitget could not confirm the account is flat, so keep the last known contracts rather than
+  // reporting a closed book the exchange never confirmed.
+  if (!contracts.length && fetched.degraded) {
+    const retained = previous.filter(item => item.side);
+    // capturedAt 0 keeps the freshness clock where it was: this data is the previous read, so
+    // it must not be presented as a new confirmation from the exchange.
+    if (retained.length) return { contracts: retained, capturedAt: 0, staleReason: fetched.degraded };
+  }
+  return { contracts, capturedAt, staleReason: fetched.degraded ?? null };
 }
 export async function disconnectBitgetAccount() { if (isTauriDesktop()) await invoke('disconnect_bitget'); mobileCredentials = undefined; }
 export async function hasSavedBitgetLogin() { return isTauriDesktop() ? invoke<boolean>('has_saved_login') : Boolean(localStorage.getItem(VAULT_KEY)); }
