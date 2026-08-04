@@ -444,6 +444,6 @@ export default function App() {
     {remoteOpen && <RemoteSyncModal onClose={() => setRemoteOpen(false)} onRemoteConnected={applyRemotePayload}/>}
     {backupOpen && <BackupModal onClose={() => setBackupOpen(false)} onImported={loadHistory}/>}
 
-    <footer><span><CircleHelp size={14}/> Encrypted .tradingjournal import/export · no API credentials included</span><span><Settings2 size={14}/> v0.3.2</span></footer>
+    <footer><span><CircleHelp size={14}/> Encrypted .tradingjournal import/export · no API credentials included</span><span><Settings2 size={14}/> v0.4.0</span></footer>
   </div>;
 }

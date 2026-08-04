@@ -93,7 +93,7 @@ export async function encryptJournalPayload(data: JournalArchiveData, password: 
     magic: MAGIC,
     formatVersion: FORMAT_VERSION,
     createdAt: Date.now(),
-    appVersion: '0.3.2',
+    appVersion: '0.4.0',
     kdf: { name: 'PBKDF2-SHA-256', iterations: KDF_ITERATIONS, salt: bytesToBase64(salt) },
     cipher: { name: 'AES-256-GCM', iv: bytesToBase64(iv) },
     ciphertext: bytesToBase64(ciphertext),
@@ -124,7 +124,7 @@ export async function createJournalBackup(password: string) {
   const data: JournalArchiveData = {
     schemaVersion: 1,
     exportedAt: Date.now(),
-    appVersion: '0.3.2',
+    appVersion: '0.4.0',
     trades: listTrades(),
     playbooks: listPlaybooks(),
     tradingNotes: await loadTradingNotes(),
